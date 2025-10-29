@@ -66,4 +66,4 @@ function buildRouter(){
   return router;
 }
 
-module.exports = { buildRouter };
+module.exports = { buildRouter, __ENDPOINTS: ENDPOINTS };
