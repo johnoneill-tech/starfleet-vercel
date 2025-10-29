@@ -1,17 +1,15 @@
-const start = Date.now();
-try {
-  const routes = require("../src/routes");
-  console.log("Imported routes in", Date.now() - start, "ms");
-  module.exports = (req, res) => {
-    res.status(200).json({
-      ok: true,
-      message: "Imported successfully",
-      time: Date.now() - start,
-      type: typeof routes.buildRouter,
-    });
-  };
-} catch (e) {
-  module.exports = (req, res) => {
-    res.status(500).json({ ok: false, error: e.message, stack: e.stack });
-  };
-}
+// api/[...any].js
+const express = require("express");
+const { buildRouter, __ENDPOINTS } = require("../src/routes");
+
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+app.get("/healthz", (_req, res) => res.json({ ok: true, from: "express-direct" }));
+app.get("/__routes", (_req, res) => res.json({ count: __ENDPOINTS?.length || 0, routes: __ENDPOINTS || [] }));
+
+app.use(buildRouter());
+
+app.use((_req, res) => res.status(404).json({ ok: false, error: "Not Found", path: _req.path }));
+
+module.exports = (req, res) => app(req, res);

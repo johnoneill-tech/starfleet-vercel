@@ -1,8 +1,9 @@
+// src/db.js
 const { MongoClient, ServerApiVersion } = require("mongodb");
-let db;
+let client, db;
 async function getDb() {
   if (db) return db;
-  const client = new MongoClient(process.env.MONGODB_URI, {
+  client = new MongoClient(process.env.MONGODB_URI, {
     serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true }
   });
   await client.connect();
