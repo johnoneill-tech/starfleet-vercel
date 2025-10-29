@@ -15,6 +15,11 @@ app.use((req, _res, next) => {
 app.get("/healthz", (_req, res) => res.json({ ok: true, from: "express-direct" }));
 app.get("/__routes", (_req, res) => res.json({ count: __ENDPOINTS?.length || 0, routes: __ENDPOINTS || [] }));
 
+// TEMP probe: should respond at /api/Starfleet/ranks
+app.get("/Starfleet/ranks", (_req, res) => {
+  res.json({ ok: true, probe: "static /Starfleet/ranks matched" });
+});
+
 app.use(buildRouter());
 
 app.use((_req, res) => res.status(404).json({ ok: false, error: "Not Found", path: _req.path }));
