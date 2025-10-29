@@ -37,4 +37,6 @@ app.get("/api/_debug/fs", async (_req, res) => {
   res.json({ cwd: process.cwd(), exists: fs.existsSync(p), path: p });
 });
 
+app.get("/api/_debug/ok", (_req, res) => res.json({ ok: true, from: "express" }));
+
 module.exports = serverless(app);
