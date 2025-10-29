@@ -21,4 +21,20 @@ app.use(buildRouter());
 
 app.get("/api/healthz", (_req, res) => res.json({ ok: true }));
 
+// List the routes we registered from src/routes.js
+app.get("/api/_debug/routes", (_req, res) => {
+  const { buildRouter } = require("../src/routes");
+  // Rebuild router and read the endpoints array directly:
+  const endpoints = require("../src/routes").__ENDPOINTS || [];
+  res.json({ endpoints });
+});
+
+// Check if the function file is in the bundle
+app.get("/api/_debug/fs", async (_req, res) => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const p = path.resolve(process.cwd(), "MDBScripts/functions/Starfleet_ranks.js");
+  res.json({ cwd: process.cwd(), exists: fs.existsSync(p), path: p });
+});
+
 module.exports = serverless(app);
