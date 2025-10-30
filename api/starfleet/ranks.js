@@ -5,45 +5,68 @@ const { EJSON } = require("bson");
 const { getDb } = require("../../src/db");
 const { makeRealmContext } = require("../../src/realm_shim");
 
-// Load a Realm function from MDBScripts/functions/*.js via VM
-async function loadRealmFunction(functionName) {
+// Load Realm function with a sandbox that already has a GLOBAL `context`
+async function loadRealmFunctionWithContext(functionName, realmContext) {
   const filePath = path.resolve(process.cwd(), "MDBScripts/functions", `${functionName}.js`);
   const code = await fs.readFile(filePath, "utf8");
-  const sandbox = { exports: undefined, module: { exports: undefined }, console, EJSON };
+
+  // Prepare a sandbox where `context` is available as a global (Realm-style)
+  const sandbox = {
+    exports: undefined,
+    module: { exports: undefined },
+    console,
+    EJSON,
+    context: realmContext,          // direct global
+    globalThis: {},                 // we'll attach below
+    global: {},                     // and here as well
+  };
+  sandbox.globalThis = sandbox;
+  sandbox.global = sandbox;
+
   vm.createContext(sandbox);
   new vm.Script(code, { filename: `${functionName}.js` }).runInContext(sandbox);
-  return sandbox.exports ?? sandbox.module.exports;
+
+  const fn = sandbox.exports ?? sandbox.module.exports;
+  if (typeof fn !== "function") {
+    throw new Error(`Function not exported: ${functionName}`);
+  }
+  // Return both function and sandbox so calls can still resolve globals from the same context
+  return { fn, sandbox };
 }
 
-// Try the common Realm function signatures
-async function invokeRealmFunction(fn, req, context) {
+// Try common Realm function signatures
+async function invokeRealmFunction(fn, req, realmContext) {
   const payload = req.body ?? {};
   const query = req.query ?? {};
   const headers = req.headers ?? {};
 
-  try { return await fn(payload, query, headers, context); } catch {}
-  try { return await fn(payload, query, context); } catch {}
-  try { return await fn(payload, context); } catch {}
-  try { return await fn(context, payload, query, headers); } catch {}
-  try { return await fn(context, payload, query); } catch {}
-  return await fn(payload);
+  // Try signatures in order of likelihood; ignore errors until one works
+  try { return await fn(payload, query, headers, realmContext); } catch {}
+  try { return await fn(payload, query, realmContext); } catch {}
+  try { return await fn(payload, realmContext); } catch {}
+  try { return await fn(realmContext, payload, query, headers); } catch {}
+  try { return await fn(realmContext, payload, query); } catch {}
+  try { return await fn(payload); } catch {}
+
+  // Last resort: no-arg style (purely global-based)
+  return await fn();
 }
 
 module.exports = async (req, res) => {
   try {
-    // Ensure correct HTTP method for this endpoint
     if (req.method.toUpperCase() !== "GET") {
       res.setHeader("Allow", "GET");
       return res.status(405).json({ ok: false, error: "Method Not Allowed" });
     }
 
-    const fn = await loadRealmFunction("Starfleet_ranks");
-    if (typeof fn !== "function") throw new Error("Function not exported: Starfleet_ranks");
-
+    // Build Realm-like context first so it's available as a global during evaluation
     const db = await getDb();
-    const context = makeRealmContext(db);
-    const result = await invokeRealmFunction(fn, req, context);
+    const realmContext = makeRealmContext(db);
 
+    const { fn } = await loadRealmFunctionWithContext("Starfleet_ranks", realmContext);
+    const result = await invokeRealmFunction(fn, req, realmContext);
+
+    // Normal JSON for this endpoint
     return res.json(result);
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
