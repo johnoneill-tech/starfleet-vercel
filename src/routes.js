@@ -6,7 +6,7 @@ const { EJSON } = require("bson");
 const { getDb } = require("./db");
 const { makeRealmContext } = require("./realm_shim");
 
-// EXACT endpoints you provided (already lowercased)
+// EXACT endpoints you provided
 const ENDPOINTS = [
   { route: "/starfleet/systems",       http_method: "*",   function_name: "Systems",                           respond_result: true, return_type: "JSON" },
   { route: "/starfleet/events",        http_method: "*",   function_name: "Starfleet_events",                  respond_result: true },
@@ -50,14 +50,12 @@ async function invokeRealmFunction(fn, req, context) {
 }
 
 function respond(res, result, ep) {
-  // If the endpoint specifies EJSON, serialize with EJSON.stringify
-  if ((ep.return_type || "").toUpperCase() === "EJSON") {
+  const rt = (ep.return_type || "JSON").toUpperCase();
+  if (rt === "EJSON") {
     res.type("application/json");
-    // If result is already a string, assume it's EJSON; otherwise serialize it
     if (typeof result === "string") return res.send(result);
     return res.send(EJSON.stringify(result));
   }
-  // Default: normal JSON
   return res.json(result);
 }
 
@@ -67,7 +65,6 @@ function buildRouter() {
 
   for (const ep of ENDPOINTS) {
     const filePath = path.join(functionsDir, `${ep.function_name}.js`);
-
     const handler = async (req, res) => {
       try {
         const db = await getDb();
@@ -88,10 +85,13 @@ function buildRouter() {
     for (const m of methodsFor(ep)) {
       router[m](ep.route, handler);
       router[m](`${ep.route}/`, handler); // tolerate trailing slash
+      // Also accept the "/api" prefixed path in case req.url includes it in this environment
+      router[m](`/api${ep.route}`, handler);
+      router[m](`/api${ep.route}/`, handler);
     }
   }
 
-  // Router probe for live verification
+  // Router probe
   router.get("/__router_probe", (_req, res) => {
     res.json({
       mounted: true,

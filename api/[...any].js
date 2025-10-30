@@ -4,58 +4,37 @@ const { buildRouter, __ENDPOINTS } = require("../src/routes");
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// Normalize routing behavior
+// Relax matching a bit
 app.set("case sensitive routing", false);
 app.set("strict routing", false);
 
-// Strip /api and normalize (collapse slashes, trim trailing, LOWERCASE)
-app.use((req, _res, next) => {
-  let u = req.url || "/";
-  if (u.startsWith("/api")) u = u.slice(4) || "/";
-  u = u.replace(/\/{2,}/g, "/");
-  if (u.length > 1 && u.endsWith("/")) u = u.slice(0, -1);
-  u = u.toLowerCase();
-  req.url = u;
-  next();
-});
-
-// Quick echo for ANY path when you add ?__echo=1
-app.use((req, res, next) => {
-  if (req.query && (req.query.__echo === "1" || req.query.__echo === 1)) {
-    return res.json({
-      ok: true,
-      method: req.method,
-      url: req.url,
-      originalUrl: req.originalUrl,
-      note: "This is after /api strip + normalization (lowercased).",
-    });
-  }
-  next();
-});
-
-// Health/debug
+// Health/debug (available under both / and /api/ because we mount the router twice below)
 app.get("/healthz", (_req, res) => res.json({ ok: true, from: "express-direct" }));
 app.get("/__routes", (_req, res) =>
   res.json({ count: __ENDPOINTS?.length || 0, routes: __ENDPOINTS || [] })
 );
 
-// ***** APP-LEVEL CANARIES (before router) *****
-// If either of these responds, Express path matching is fine.
-app.all("/starfleet/ranks", (_req, res) =>
-  res.json({ ok: true, layer: "app", path: "/starfleet/ranks", note: "App-level canary matched." })
-);
-app.all("/starfleet/ranks/", (_req, res) =>
-  res.json({ ok: true, layer: "app", path: "/starfleet/ranks/", note: "App-level canary matched (slash)." })
-);
+// Echo what Express actually sees for this function invocation
+app.all("/__echo", (req, res) => {
+  res.json({
+    ok: true,
+    method: req.method,
+    url: req.url,              // what Express is matching on
+    originalUrl: req.originalUrl
+  });
+});
 
-// Mount dynamic Starfleet routes at root
-app.use("/", buildRouter());
+// Mount Starfleet router at BOTH "/" and "/api"
+// This covers both cases: when Vercel includes "/api" in req.url and when it doesn't.
+const router = buildRouter();
+app.use("/", router);
+app.use("/api", router);
 
-// Dump the full app stack (paths + methods)
+// Dump the full app stack for inspection
 app.get("/__stack", (_req, res) => {
   try {
     const stack = (app._router?.stack || [])
-      .map((l) => {
+      .map(l => {
         if (l.route) {
           const methods = Object.keys(l.route.methods || {}).filter(Boolean);
           return { path: l.route.path, methods };
@@ -78,14 +57,9 @@ app.get("/__stack", (_req, res) => {
   }
 });
 
-// Fallback 404 (debug)
+// Fallback 404
 app.use((req, res) =>
-  res.status(404).json({
-    ok: false,
-    error: "Not Found",
-    path: req.originalUrl || req.url,
-    note: "This is the Express fallback after all routes."
-  })
+  res.status(404).json({ ok: false, error: "Not Found", path: req.originalUrl || req.url })
 );
 
 module.exports = (req, res) => app(req, res);
