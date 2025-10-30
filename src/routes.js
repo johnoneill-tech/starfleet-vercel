@@ -71,6 +71,14 @@ function buildRouter() {
     };
 
     for (const m of methodsFor(ep)) router[m](ep.route, handler);
+
+    // Router self-probe for live verification
+    router.get("/__router_probe", (_req, res) => {
+      res.json({
+        mounted: true,
+        endpoints: ENDPOINTS.map(e => ({ route: e.route, methods: methodsFor(e) }))
+      });
+    });
   }
 
   return router;
