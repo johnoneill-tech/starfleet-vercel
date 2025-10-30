@@ -6,7 +6,7 @@ const { EJSON } = require("bson");
 const { getDb } = require("./db");
 const { makeRealmContext } = require("./realm_shim");
 
-// EXACT endpoints you provided
+// EXACT endpoints you provided (lowercased)
 const ENDPOINTS = [
   { route: "/starfleet/systems",       http_method: "*",   function_name: "Systems",                           respond_result: true, return_type: "JSON" },
   { route: "/starfleet/events",        http_method: "*",   function_name: "Starfleet_events",                  respond_result: true },
@@ -28,25 +28,44 @@ function methodsFor(ep) {
     : [ep.http_method.toLowerCase()];
 }
 
-async function loadRealmFunctionFromFile(filePath) {
+// Load a Realm function file and evaluate it with a sandbox that already has GLOBAL `context`
+async function loadRealmFunctionFromFile(filePath, realmContext) {
   const code = await fs.readFile(filePath, "utf8");
-  const sandbox = { exports: undefined, module: { exports: undefined }, console, EJSON };
+
+  const sandbox = {
+    exports: undefined,
+    module: { exports: undefined },
+    console,
+    EJSON,
+    context: realmContext,   // Realm-style global
+    globalThis: {},          // will be linked to sandbox
+    global: {},              // will be linked to sandbox
+  };
+  sandbox.globalThis = sandbox;
+  sandbox.global = sandbox;
+
   vm.createContext(sandbox);
   new vm.Script(code, { filename: path.basename(filePath) }).runInContext(sandbox);
-  return sandbox.exports ?? sandbox.module.exports;
+
+  const fn = sandbox.exports ?? sandbox.module.exports;
+  if (typeof fn !== "function") {
+    throw new Error(`Function not exported: ${path.basename(filePath)}`);
+  }
+  return fn;
 }
 
-// Try common Realm function signatures
-async function invokeRealmFunction(fn, req, context) {
+// Try common Realm function signatures & fallbacks
+async function invokeRealmFunction(fn, req, realmContext) {
   const payload = req.body ?? {};
   const query = req.query ?? {};
   const headers = req.headers ?? {};
-  try { return await fn(payload, query, headers, context); } catch {}
-  try { return await fn(payload, query, context); } catch {}
-  try { return await fn(payload, context); } catch {}
-  try { return await fn(context, payload, query, headers); } catch {}
-  try { return await fn(context, payload, query); } catch {}
-  return await fn(payload);
+  try { return await fn(payload, query, headers, realmContext); } catch {}
+  try { return await fn(payload, query, realmContext); } catch {}
+  try { return await fn(payload, realmContext); } catch {}
+  try { return await fn(realmContext, payload, query, headers); } catch {}
+  try { return await fn(realmContext, payload, query); } catch {}
+  try { return await fn(payload); } catch {}
+  return await fn(); // pure global usage
 }
 
 function respond(res, result, ep) {
@@ -65,16 +84,16 @@ function buildRouter() {
 
   for (const ep of ENDPOINTS) {
     const filePath = path.join(functionsDir, `${ep.function_name}.js`);
+
     const handler = async (req, res) => {
       try {
         const db = await getDb();
-        const context = makeRealmContext(db);
-        const fn = await loadRealmFunctionFromFile(filePath);
-        if (typeof fn !== "function") throw new Error(`Function not exported: ${ep.function_name}`);
+        const realmContext = makeRealmContext(db); // build before load so global `context` is available while evaluating
+        const fn = await loadRealmFunctionFromFile(filePath, realmContext);
 
         const result = ep.respond_result
-          ? await invokeRealmFunction(fn, req, context)
-          : (await invokeRealmFunction(fn, req, context), { ok: true });
+          ? await invokeRealmFunction(fn, req, realmContext)
+          : (await invokeRealmFunction(fn, req, realmContext), { ok: true });
 
         return respond(res, result, ep);
       } catch (e) {
@@ -85,13 +104,10 @@ function buildRouter() {
     for (const m of methodsFor(ep)) {
       router[m](ep.route, handler);
       router[m](`${ep.route}/`, handler); // tolerate trailing slash
-      // Also accept the "/api" prefixed path in case req.url includes it in this environment
-      router[m](`/api${ep.route}`, handler);
-      router[m](`/api${ep.route}/`, handler);
     }
   }
 
-  // Router probe
+  // Router probe for live verification
   router.get("/__router_probe", (_req, res) => {
     res.json({
       mounted: true,
