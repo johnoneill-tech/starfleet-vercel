@@ -31,73 +31,119 @@ module.exports = async (req, res) => {
     const db = await getDb();
     const col = db.collection("officers");
 
+    // inside api/starfleet/starships.js, replace ONLY the GET handler
     if (method === "GET") {
-      const u = parseUrl(req);
-      const id = u.searchParams.get("id");
-      const name = (u.searchParams.get("name") || "").trim(); // Realm uses ?name=
-      const perPage = Math.max(1, Math.min(parseInt(u.searchParams.get("personnelPerPage") || "10", 10), 200));
-      const page = Math.max(0, parseInt(u.searchParams.get("page") || "0", 10));
-      const skip = page * perPage;
+    const u = parseUrl(req);
+    const id = u.searchParams.get("id");
+    const name = (u.searchParams.get("name") || "").trim();
+    const klass = (u.searchParams.get("class") || "").trim();
+    const timeframe = (u.searchParams.get("timeframe") || "").trim();
 
-      if (id) {
+    const perPage = Math.max(1, Math.min(parseInt(u.searchParams.get("starshipsPerPage") || "12", 10), 200));
+    const cursor = (u.searchParams.get("cursor") || "").trim(); // NEW
+
+    if (id) {
         const _id = toObjectId(id, "id");
         const doc = await col.aggregate([
-          { $match: { _id } },
-          { $lookup: {
-              from: "photos",
-              let: { ownerId: "$_id" },
-              pipeline: [
-                { $match: { $expr: { $eq: ["$owner", "$$ownerId"] } } },
-                { $sort: { created_at: -1, _id: -1 } },
-                { $limit: 1 },
-                { $project: { _id: 0, url: 1 } }
-              ],
-              as: "primaryPhoto"
-          }},
-          { $addFields: { picUrl: { $ifNull: [ { $arrayElemAt: ["$primaryPhoto.url", 0] }, null ] } } },
-          { $project: { _id: 1, name: 1, first: 1, middle: 1, surname: 1, rank: 1, division: 1, picUrl: 1 } }
-        ]).next();
-
-        if (!doc) return json(res, 404, { ok: false, error: "Not Found" });
-        return json(res, 200, { ok: true, id: String(doc._id), ...doc, _id: undefined });
-      }
-
-      const filter = {};
-      if (name) {
-        // contains on surname OR first (case-insensitive)
-        const re = new RegExp(escRe(name), "i");
-        filter.$or = [{ surname: re }, { first: re }];
-      }
-
-      const docs = await col.aggregate([
-        { $match: filter },
-        { $sort: { surname: 1, first: 1, middle: 1, _id: 1 } },
-        { $skip: skip },
-        { $limit: perPage },
+        { $match: { _id } },
         { $lookup: {
             from: "photos",
             let: { ownerId: "$_id" },
             pipeline: [
-              { $match: { $expr: { $eq: ["$owner", "$$ownerId"] } } },
-              { $sort: { created_at: -1, _id: -1 } },
-              { $limit: 1 },
-              { $project: { _id: 0, url: 1 } }
+                { $match: { $expr: { $eq: ["$owner", "$$ownerId"] } } },
+                { $sort: { created_at: -1, _id: -1 } },
+                { $limit: 1 },
+                { $project: { _id: 0, url: 1 } }
             ],
             as: "primaryPhoto"
         }},
         { $addFields: { picUrl: { $ifNull: [ { $arrayElemAt: ["$primaryPhoto.url", 0] }, null ] } } },
-        { $project: { _id: 1, name: 1, first: 1, middle: 1, surname: 1, rank: 1, division: 1, picUrl: 1 } }
-      ]).toArray();
-
-      const items = docs.map(d => ({
-        id: String(d._id),
-        name: d.name ?? [d.first, d.middle, d.surname].filter(Boolean).join(" "),
-        rank: d.rank,
-        division: d.division,
-        picUrl: d.picUrl
-      }));
-      return json(res, 200, items);
+        { $project: { _id: 1, name: 1, class: 1, registry: 1, ship_id: 1, picUrl: 1 } }
+        ]).next();
+        if (!doc) return json(res, 404, { ok: false, error: "Not Found" });
+        return json(res, 200, { ok: true, id: String(doc._id), ...doc, _id: undefined });
     }
+
+    // Build filters (same as before)
+    const filter = {};
+    if (name) filter.name = { $regex: "^" + escRe(name) + ".*", $options: "i" }; // prefix
+    if (klass) {
+        if (klass === "All") {
+        // no-op
+        } else if (klass === "Unknown") {
+        filter.$or = [
+            ...(filter.$or || []),
+            { class: { $exists: false } },
+            { class: null },
+            { class: "" }
+        ];
+        } else {
+        filter.class = { $regex: "^" + escRe(klass) + "$", $options: "i" }; // exact (ci)
+        }
+    }
+    Object.assign(filter, timeframeMatch(timeframe)); // ship_id ranges
+
+    // Cursor decoding: base64("ship_id:_idHex")
+    let afterShipId = null, afterId = null;
+    if (cursor) {
+        try {
+        const decoded = Buffer.from(cursor, "base64").toString("utf8"); // e.g. "2500:65f2...ab3"
+        const [sid, hex] = decoded.split(":");
+        afterShipId = Number(sid);
+        afterId = toObjectId(hex, "cursor");
+        if (!Number.isFinite(afterShipId)) throw new Error("bad ship_id");
+        } catch {
+        return json(res, 400, { ok: false, error: "Invalid cursor" });
+        }
+    }
+
+    // Keyset (seek) condition: (ship_id > afterShipId) OR (ship_id == afterShipId AND _id > afterId)
+    const seek = (afterShipId != null && afterId)
+        ? { $or: [ { ship_id: { $gt: afterShipId } }, { ship_id: afterShipId, _id: { $gt: afterId } } ] }
+        : {};
+
+    const finalMatch = Object.keys(seek).length ? { $and: [filter, seek] } : filter;
+
+    // Fetch perPage + 1 to detect next page
+    const docs = await col.aggregate([
+        { $match: finalMatch },
+        { $sort: { ship_id: 1, _id: 1 } },
+        { $limit: perPage + 1 },
+        { $lookup: {
+            from: "photos",
+            let: { ownerId: "$_id" },
+            pipeline: [
+            { $match: { $expr: { $eq: ["$owner", "$$ownerId"] } } },
+            { $sort: { created_at: -1, _id: -1 } },
+            { $limit: 1 },
+            { $project: { _id: 0, url: 1 } }
+            ],
+            as: "primaryPhoto"
+        }},
+        { $addFields: { picUrl: { $ifNull: [ { $arrayElemAt: ["$primaryPhoto.url", 0] }, null ] } } },
+        { $project: { _id: 1, name: 1, class: 1, registry: 1, ship_id: 1, picUrl: 1 } }
+    ]).toArray();
+
+    let next_cursor = null;
+    let slice = docs;
+    if (docs.length > perPage) {
+        const last = docs[perPage - 1];
+        next_cursor = Buffer.from(`${last.ship_id}:${String(last._id)}`, "utf8").toString("base64");
+        slice = docs.slice(0, perPage);
+    }
+
+    const items = slice.map(d => ({
+        id: String(d._id),
+        name: d.name,
+        class: d.class,
+        registry: d.registry,
+        ship_id: d.ship_id,
+        picUrl: d.picUrl
+    }));
+
+    return json(res, 200, { items, next_cursor });
+    }
+
 
     if (method === "POST") {
       const body = await readJsonBody(req);
