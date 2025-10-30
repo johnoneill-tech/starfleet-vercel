@@ -1,4 +1,3 @@
-// src/routes.js
 const path = require("node:path");
 const fs = require("node:fs/promises");
 const vm = require("node:vm");
@@ -7,20 +6,20 @@ const { EJSON } = require("bson");
 const { getDb } = require("./db");
 const { makeRealmContext } = require("./realm_shim");
 
-// === Endpoints copied from your http_endpoints/config.js ===
+// EXACT endpoints you provided (already lowercased)
 const ENDPOINTS = [
-  { route: "/starfleet/systems",       http_method: "*",  function_name: "Systems",                            respond_result: true, return_type: "JSON" },
-  { route: "/starfleet/events",        http_method: "*",  function_name: "Starfleet_events",                   respond_result: true },
-  { route: "/starfleet/update",        http_method: "PUT",function_name: "modifiy_script",                     respond_result: true, return_type: "EJSON" },
-  { route: "/starfleet/classes",       http_method: "GET",function_name: "Starfleet_classes",                  respond_result: true },
-  { route: "/starfleet/login",         http_method: "*",  function_name: "Login",                              respond_result: true },
-  { route: "/starfleet/relationships", http_method: "*",  function_name: "Starfleet_personnel_relationships",  respond_result: true, return_type: "EJSON" },
-  { route: "/starfleet/ranks",         http_method: "GET",function_name: "Starfleet_ranks",                    respond_result: true },
-  { route: "/starfleet/photos",        http_method: "*",  function_name: "Starfleet_photos",                   respond_result: true },
-  { route: "/starfleet/personnel",     http_method: "*",  function_name: "Starfleet_personnel",                respond_result: true },
-  { route: "/starfleet/counts",        http_method: "GET",function_name: "counts",                             respond_result: true, return_type: "EJSON" },
-  { route: "/starfleet/starships",     http_method: "*",  function_name: "Starfleet_starships",                respond_result: true },
-  { route: "/starfleet/register",      http_method: "*",  function_name: "Register",                           respond_result: true },
+  { route: "/starfleet/systems",       http_method: "*",   function_name: "Systems",                           respond_result: true, return_type: "JSON" },
+  { route: "/starfleet/events",        http_method: "*",   function_name: "Starfleet_events",                  respond_result: true },
+  { route: "/starfleet/update",        http_method: "PUT", function_name: "modifiy_script",                    respond_result: true, return_type: "EJSON" },
+  { route: "/starfleet/classes",       http_method: "GET", function_name: "Starfleet_classes",                 respond_result: true },
+  { route: "/starfleet/login",         http_method: "*",   function_name: "Login",                             respond_result: true },
+  { route: "/starfleet/relationships", http_method: "*",   function_name: "Starfleet_personnel_relationships", respond_result: true, return_type: "EJSON" },
+  { route: "/starfleet/ranks",         http_method: "GET", function_name: "Starfleet_ranks",                   respond_result: true },
+  { route: "/starfleet/photos",        http_method: "*",   function_name: "Starfleet_photos",                  respond_result: true },
+  { route: "/starfleet/personnel",     http_method: "*",   function_name: "Starfleet_personnel",               respond_result: true },
+  { route: "/starfleet/counts",        http_method: "GET", function_name: "counts",                            respond_result: true, return_type: "EJSON" },
+  { route: "/starfleet/starships",     http_method: "*",   function_name: "Starfleet_starships",               respond_result: true },
+  { route: "/starfleet/register",      http_method: "*",   function_name: "Register",                          respond_result: true },
 ];
 
 function methodsFor(ep) {
@@ -37,6 +36,7 @@ async function loadRealmFunctionFromFile(filePath) {
   return sandbox.exports ?? sandbox.module.exports;
 }
 
+// Try common Realm function signatures
 async function invokeRealmFunction(fn, req, context) {
   const payload = req.body ?? {};
   const query = req.query ?? {};
@@ -49,8 +49,19 @@ async function invokeRealmFunction(fn, req, context) {
   return await fn(payload);
 }
 
+function respond(res, result, ep) {
+  // If the endpoint specifies EJSON, serialize with EJSON.stringify
+  if ((ep.return_type || "").toUpperCase() === "EJSON") {
+    res.type("application/json");
+    // If result is already a string, assume it's EJSON; otherwise serialize it
+    if (typeof result === "string") return res.send(result);
+    return res.send(EJSON.stringify(result));
+  }
+  // Default: normal JSON
+  return res.json(result);
+}
+
 function buildRouter() {
-  // Case-insensitive, non-strict (though we already lowercase at the app layer)
   const router = express.Router({ caseSensitive: false, strict: false });
   const functionsDir = path.resolve(process.cwd(), "MDBScripts/functions");
 
@@ -64,25 +75,27 @@ function buildRouter() {
         const fn = await loadRealmFunctionFromFile(filePath);
         if (typeof fn !== "function") throw new Error(`Function not exported: ${ep.function_name}`);
 
-        const result = await invokeRealmFunction(fn, req, context);
-        return res.json(result);
+        const result = ep.respond_result
+          ? await invokeRealmFunction(fn, req, context)
+          : (await invokeRealmFunction(fn, req, context), { ok: true });
+
+        return respond(res, result, ep);
       } catch (e) {
-        res.status(500).json({ ok: false, error: e.message });
+        res.status(500).json({ ok: false, error: e.message, function: ep.function_name, route: ep.route });
       }
     };
 
-    // Register canonical + trailing-slash variant
     for (const m of methodsFor(ep)) {
       router[m](ep.route, handler);
-      router[m](`${ep.route}/`, handler);
+      router[m](`${ep.route}/`, handler); // tolerate trailing slash
     }
   }
 
-  // Router self-probe for live verification
+  // Router probe for live verification
   router.get("/__router_probe", (_req, res) => {
     res.json({
       mounted: true,
-      endpoints: ENDPOINTS.map(e => ({ route: e.route, methods: methodsFor(e) }))
+      endpoints: ENDPOINTS.map(e => ({ route: e.route, methods: methodsFor(e), return_type: e.return_type || "JSON" }))
     });
   });
 
