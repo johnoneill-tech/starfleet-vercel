@@ -1,30 +1,50 @@
+// src/api_utils.js
 const path = require("node:path");
 const fs = require("node:fs/promises");
 const vm = require("node:vm");
-const { EJSON, ObjectId, BSON } = require("bson");
+const { EJSON, ObjectId } = require("bson");
 const { getDb } = require("./db");
 const { makeRealmContext } = require("./realm_shim");
 
+// Parse URL into req.query when not provided by the platform
+function ensureQueryOnReq(req) {
+  if (req.query && typeof req.query === "object") return req.query;
+  try {
+    const u = new URL(req.url || req.originalUrl || "/", "http://local");
+    const out = {};
+    for (const [k, v] of u.searchParams.entries()) {
+      // Support repeated keys → arrays
+      if (out[k] === undefined) out[k] = v;
+      else if (Array.isArray(out[k])) out[k].push(v);
+      else out[k] = [out[k], v];
+    }
+    req.query = out;
+    return out;
+  } catch {
+    req.query = {};
+    return req.query;
+  }
+}
+
 // Build a Realm-like payload object (providing body.text(), query, headers)
 function makeRealmPayload(req) {
-  const query = req.query || {};
+  const query = ensureQueryOnReq(req);
   const headers = req.headers || {};
   const rawBody = typeof req.body === "string" ? req.body : (req.body ? JSON.stringify(req.body) : "");
   return {
     query,
     headers,
-    body: {
-      text: () => rawBody || ""
-    }
+    body: { text: () => rawBody || "" }
   };
 }
 
 // Ensure context.request exists and mirrors the incoming HTTP request
 function attachRequestToContext(ctx, req) {
+  const query = ensureQueryOnReq(req);
   ctx.request = {
     httpMethod: (req.method || "GET").toUpperCase(),
     headers: req.headers || {},
-    query: req.query || {},
+    query,
     body: { text: () => (typeof req.body === "string" ? req.body : (req.body ? JSON.stringify(req.body) : "")) }
   };
   return ctx;
@@ -94,7 +114,7 @@ function makeHandler({ function_name, methods = "*", return_type = "JSON" }) {
         return send(res, 405, { ok: false, error: "Method Not Allowed" });
       }
 
-      // Ensure req.body is captured (fallback for raw body)
+      // Ensure req.body is captured when JSON
       if (!req.body && typeof req.headers?.["content-type"] === "string" && req.headers["content-type"].includes("application/json")) {
         const chunks = [];
         for await (const chunk of req) chunks.push(chunk);
