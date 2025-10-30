@@ -4,33 +4,55 @@ const { buildRouter, __ENDPOINTS } = require("../src/routes");
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// Relax matching a bit
+// Be forgiving with paths
 app.set("case sensitive routing", false);
 app.set("strict routing", false);
 
-// Health/debug (available under both / and /api/ because we mount the router twice below)
+/**
+ * Vercel catch-all quirk:
+ * When this function is defined as api/[...any].js, requests like /api/starfleet/ranks
+ * arrive with req.originalUrl = "/api/__stack?...any=starfleet/ranks" (example)
+ * and the real path segment is in req.query["...any"].
+ *
+ * Reconstruct req.url from that when present so Express can match your routes.
+ */
+app.use((req, _res, next) => {
+  const q = req.query || {};
+  const capture = q["...any"] || q.any || q.slug; // support common names just in case
+  if (capture) {
+    const segs = Array.isArray(capture) ? capture : String(capture).split("/");
+    const cleaned = segs.join("/").replace(/^\/+/, "");
+    // Keep query string (minus the ...any param) if there are other keys
+    const rest = new URL(req.originalUrl, "http://x").searchParams;
+    rest.delete("...any"); rest.delete("any"); rest.delete("slug");
+    const qs = rest.toString();
+    req.url = `/${cleaned}${qs ? `?${qs}` : ""}`;
+  }
+  // Collapse duplicate slashes and make trailing slash non-significant
+  req.url = req.url.replace(/\/{2,}/g, "/");
+  if (req.url.length > 1 && req.url.endsWith("/")) req.url = req.url.slice(0, -1);
+  next();
+});
+
+// Health/debug (these will match whether you call /api/healthz or /healthz)
 app.get("/healthz", (_req, res) => res.json({ ok: true, from: "express-direct" }));
 app.get("/__routes", (_req, res) =>
   res.json({ count: __ENDPOINTS?.length || 0, routes: __ENDPOINTS || [] })
 );
-
-// Echo what Express actually sees for this function invocation
 app.all("/__echo", (req, res) => {
   res.json({
     ok: true,
     method: req.method,
-    url: req.url,              // what Express is matching on
+    url: req.url,          // after reconstruction
     originalUrl: req.originalUrl
   });
 });
 
-// Mount Starfleet router at BOTH "/" and "/api"
-// This covers both cases: when Vercel includes "/api" in req.url and when it doesn't.
-const router = buildRouter();
-app.use("/", router);
-app.use("/api", router);
+// Mount your dynamic router once at root;
+// reconstructed req.url already begins with "/starfleet/..."
+app.use(buildRouter());
 
-// Dump the full app stack for inspection
+// App stack dump (for sanity checks)
 app.get("/__stack", (_req, res) => {
   try {
     const stack = (app._router?.stack || [])
