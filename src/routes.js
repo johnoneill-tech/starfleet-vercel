@@ -28,7 +28,7 @@ function methodsFor(ep) {
     : [ep.http_method.toLowerCase()];
 }
 
-// Load a Realm function file and evaluate it with a sandbox that already has GLOBAL `context`
+// Load Realm function with GLOBAL `context` in the sandbox (Realm-style)
 async function loadRealmFunctionFromFile(filePath, realmContext) {
   const code = await fs.readFile(filePath, "utf8");
 
@@ -37,9 +37,9 @@ async function loadRealmFunctionFromFile(filePath, realmContext) {
     module: { exports: undefined },
     console,
     EJSON,
-    context: realmContext,   // Realm-style global
-    globalThis: {},          // will be linked to sandbox
-    global: {},              // will be linked to sandbox
+    context: realmContext, // Realm global
+    globalThis: null,
+    global: null,
   };
   sandbox.globalThis = sandbox;
   sandbox.global = sandbox;
@@ -88,7 +88,7 @@ function buildRouter() {
     const handler = async (req, res) => {
       try {
         const db = await getDb();
-        const realmContext = makeRealmContext(db); // build before load so global `context` is available while evaluating
+        const realmContext = makeRealmContext(db); // create before load so global exists during eval
         const fn = await loadRealmFunctionFromFile(filePath, realmContext);
 
         const result = ep.respond_result
@@ -103,17 +103,9 @@ function buildRouter() {
 
     for (const m of methodsFor(ep)) {
       router[m](ep.route, handler);
-      router[m](`${ep.route}/`, handler); // tolerate trailing slash
+      router[m](`${ep.route}/`, handler); // accept trailing slash
     }
   }
-
-  // Router probe for live verification
-  router.get("/__router_probe", (_req, res) => {
-    res.json({
-      mounted: true,
-      endpoints: ENDPOINTS.map(e => ({ route: e.route, methods: methodsFor(e), return_type: e.return_type || "JSON" }))
-    });
-  });
 
   return router;
 }
