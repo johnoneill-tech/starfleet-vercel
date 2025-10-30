@@ -10,7 +10,7 @@ module.exports = async (req, res) => {
       return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
     }
 
-    // Parse query (no Express here)
+    // Read ?search= from the URL (no Express)
     let search = "";
     try {
       const u = new URL(req.url || req.originalUrl || "/", "http://local");
@@ -20,12 +20,20 @@ module.exports = async (req, res) => {
     const db = await getDb();
     const col = db.collection("starships");
 
-    const filter = search
-      ? { class: { $type: "string", $ne: "", $regex: `^${search}.*`, $options: "i" } }
+    // Build API-v1-friendly aggregation (no `distinct` command)
+    const match = search
+      ? { class: { $type: "string", $ne: "", $regex: `^${search}`, $options: "i" } }
       : { class: { $type: "string", $ne: "" } };
 
-    const classes = await col.distinct("class", filter);
-    classes.sort((a, b) => a.localeCompare(b));
+    const pipeline = [
+      { $match: match },
+      { $group: { _id: "$class" } },
+      { $project: { _id: 0, class: "$_id" } },
+      { $sort: { class: 1 } }
+    ];
+
+    const docs = await col.aggregate(pipeline, { allowDiskUse: false }).toArray();
+    const classes = docs.map(d => d.class).filter(Boolean);
 
     res.statusCode = 200;
     res.setHeader("content-type", "application/json; charset=utf-8");
