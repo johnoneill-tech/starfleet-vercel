@@ -6,7 +6,7 @@ const { EJSON } = require("bson");
 const { getDb } = require("./db");
 const { makeRealmContext } = require("./realm_shim");
 
-// EXACT endpoints you provided (lowercased)
+// EXACT endpoints you provided (lowercased paths recommended; router is case-insensitive)
 const ENDPOINTS = [
   { route: "/starfleet/systems",       http_method: "*",   function_name: "Systems",                           respond_result: true, return_type: "JSON" },
   { route: "/starfleet/events",        http_method: "*",   function_name: "Starfleet_events",                  respond_result: true },
@@ -28,19 +28,17 @@ function methodsFor(ep) {
     : [ep.http_method.toLowerCase()];
 }
 
-// Load Realm function with GLOBAL `context` in the sandbox (Realm-style)
+// Load Realm function with GLOBAL `context` in the sandbox
 async function loadRealmFunctionFromFile(filePath, realmContext) {
   const code = await fs.readFile(filePath, "utf8");
-
   const sandbox = {
     exports: undefined,
     module: { exports: undefined },
     console,
     EJSON,
-    context: realmContext, // Realm global
-    globalThis: null,
-    global: null,
+    context: realmContext, // Realm-style global
   };
+  // Ensure globalThis/global refer to the same sandbox so "globalThis.context" also works
   sandbox.globalThis = sandbox;
   sandbox.global = sandbox;
 
@@ -84,7 +82,6 @@ function buildRouter() {
 
   for (const ep of ENDPOINTS) {
     const filePath = path.join(functionsDir, `${ep.function_name}.js`);
-
     const handler = async (req, res) => {
       try {
         const db = await getDb();
