@@ -2,6 +2,7 @@
 const { getDb } = require("../../src/db");
 const { ObjectId } = require("bson");
 
+/* utils */
 function json(res, status, data) {
   res.statusCode = status;
   res.setHeader("content-type", "application/json; charset=utf-8");
@@ -22,6 +23,7 @@ function toObjectId(id, field = "id") {
   try { return new ObjectId(String(id)); }
   catch { throw new Error(`Invalid ${field}: must be a 24-hex ObjectId string`); }
 }
+function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
@@ -32,32 +34,68 @@ module.exports = async (req, res) => {
     if (method === "GET") {
       const u = parseUrl(req);
       const id = u.searchParams.get("id");
-      const search = (u.searchParams.get("search") || "").trim();
-      const limit = Math.max(0, Math.min(parseInt(u.searchParams.get("limit") || "50", 10), 200));
+      const name = (u.searchParams.get("name") || "").trim(); // Realm uses ?name=
+      const perPage = Math.max(1, Math.min(parseInt(u.searchParams.get("personnelPerPage") || "10", 10), 200));
       const page = Math.max(0, parseInt(u.searchParams.get("page") || "0", 10));
-      const skip = page * limit;
+      const skip = page * perPage;
 
       if (id) {
         const _id = toObjectId(id, "id");
-        const doc = await col.findOne(
-          { _id },
-          { projection: { _id: 1, name: 1, rank: 1, division: 1 } }
-        );
+        const doc = await col.aggregate([
+          { $match: { _id } },
+          { $lookup: {
+              from: "photos",
+              let: { ownerId: "$_id" },
+              pipeline: [
+                { $match: { $expr: { $eq: ["$owner", "$$ownerId"] } } },
+                { $sort: { created_at: -1, _id: -1 } },
+                { $limit: 1 },
+                { $project: { _id: 0, url: 1 } }
+              ],
+              as: "primaryPhoto"
+          }},
+          { $addFields: { picUrl: { $ifNull: [ { $arrayElemAt: ["$primaryPhoto.url", 0] }, null ] } } },
+          { $project: { _id: 1, name: 1, first: 1, middle: 1, surname: 1, rank: 1, division: 1, picUrl: 1 } }
+        ]).next();
+
         if (!doc) return json(res, 404, { ok: false, error: "Not Found" });
-        return json(res, 200, { ok: true, id: String(doc._id), name: doc.name, rank: doc.rank, division: doc.division });
+        return json(res, 200, { ok: true, id: String(doc._id), ...doc, _id: undefined });
       }
 
       const filter = {};
-      if (search) filter.name = { $regex: search, $options: "i" }; // CONTAINS match
+      if (name) {
+        // contains on surname OR first (case-insensitive)
+        const re = new RegExp(escRe(name), "i");
+        filter.$or = [{ surname: re }, { first: re }];
+      }
 
-      const docs = await col
-        .find(filter, { projection: { _id: 1, name: 1, rank: 1, division: 1 } })
-        .sort({ name: 1 })
-        .skip(skip)
-        .limit(limit)
-        .toArray();
+      const docs = await col.aggregate([
+        { $match: filter },
+        { $sort: { surname: 1, first: 1, middle: 1, _id: 1 } },
+        { $skip: skip },
+        { $limit: perPage },
+        { $lookup: {
+            from: "photos",
+            let: { ownerId: "$_id" },
+            pipeline: [
+              { $match: { $expr: { $eq: ["$owner", "$$ownerId"] } } },
+              { $sort: { created_at: -1, _id: -1 } },
+              { $limit: 1 },
+              { $project: { _id: 0, url: 1 } }
+            ],
+            as: "primaryPhoto"
+        }},
+        { $addFields: { picUrl: { $ifNull: [ { $arrayElemAt: ["$primaryPhoto.url", 0] }, null ] } } },
+        { $project: { _id: 1, name: 1, first: 1, middle: 1, surname: 1, rank: 1, division: 1, picUrl: 1 } }
+      ]).toArray();
 
-      const items = docs.map(d => ({ id: String(d._id), name: d.name, rank: d.rank, division: d.division }));
+      const items = docs.map(d => ({
+        id: String(d._id),
+        name: d.name ?? [d.first, d.middle, d.surname].filter(Boolean).join(" "),
+        rank: d.rank,
+        division: d.division,
+        picUrl: d.picUrl
+      }));
       return json(res, 200, items);
     }
 
