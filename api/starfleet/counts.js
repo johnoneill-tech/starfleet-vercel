@@ -1,30 +1,45 @@
 // api/starfleet/counts.js
 const { getDb } = require("../../src/db");
-const { setCors, handlePreflight } = require("../../src/cors"); // optional, if you added cors.js
 
 module.exports = async (req, res) => {
-  if (handlePreflight && handlePreflight(req, res)) return; // for OPTIONS preflight
-
   try {
-    if (setCors) setCors(res);
+    const method = (req.method || "GET").toUpperCase();
 
-    const url = new URL(req.url, "http://localhost");
-    const categoryParam = url.searchParams.get("category") || "starships";
+    // Respond to preflight quickly; vercel.json will attach headers
+    if (method === "OPTIONS") {
+      res.statusCode = 204; // No Content
+      return res.end();
+    }
 
-    // Match Realm behavior: if category = personnel → use "officers"
+    if (method !== "GET") {
+      res.statusCode = 405;
+      res.setHeader("Allow", "GET, OPTIONS");
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+    }
+
+    // Read query
+    let categoryParam = "starships";
+    try {
+      const u = new URL(req.url || req.originalUrl || "/", "http://local");
+      categoryParam = (u.searchParams.get("category") || "starships").trim();
+    } catch {}
+
+    // Realm behavior: "personnel" → "officers"
     const category = categoryParam === "personnel" ? "officers" : categoryParam;
 
     const db = await getDb();
     const col = db.collection(category);
 
-    const count = await col.countDocuments();
-    return res
-      .status(200)
-      .json({ ok: true, category, count: count.toString() });
+    // API v1 strict–friendly
+    const count = await col.countDocuments({});
+
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    return res.end(JSON.stringify({ count: String(count) }));
   } catch (e) {
-    console.error("counts error:", e);
-    return res
-      .status(500)
-      .json({ ok: false, error: e.message || "Internal error" });
+    res.statusCode = 500;
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    return res.end(JSON.stringify({ ok: false, error: e.message || "Internal error" }));
   }
 };
