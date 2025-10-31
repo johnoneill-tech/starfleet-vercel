@@ -33,7 +33,7 @@ module.exports = async (req, res) => {
       const pipeline = [
         { $match: { _id: new ObjectId(id) } },
 
-        // lastAssignment (with ship)
+        // lastAssignment with ship
         {
           $lookup: {
             from: "events",
@@ -125,13 +125,27 @@ module.exports = async (req, res) => {
         { $addFields: { lifeEventCount: "$lifeEvents.lifeEventsNum" } },
         { $project: { lifeEvents: 0 } },
 
-        // photos: primary, then newest-any
+        // photos: compare as strings (handles owner stored as ObjectId or string)
         {
           $lookup: {
             from: "photos",
             let: { id: "$_id" },
             pipeline: [
-              { $match: { $and: [{ $expr: { $eq: ["$owner", "$$id"] } }, { primary: true }] } },
+              {
+                $match: {
+                  $and: [
+                    {
+                      $expr: {
+                        $eq: [
+                          { $toString: "$owner" },
+                          { $toString: "$$id" }
+                        ]
+                      }
+                    },
+                    { primary: true }
+                  ]
+                }
+              },
               { $project: { _id: 0, url: 1 } }
             ],
             as: "primaryPics"
@@ -142,7 +156,26 @@ module.exports = async (req, res) => {
             from: "photos",
             let: { id: "$_id" },
             pipeline: [
-              { $match: { $expr: { $or: [{ $eq: ["$owner", "$$id"] }, { $eq: ["$subject_id", "$$id"] }] } } },
+              {
+                $match: {
+                  $expr: {
+                    $or: [
+                      {
+                        $eq: [
+                          { $toString: "$owner" },
+                          { $toString: "$$id" }
+                        ]
+                      },
+                      {
+                        $eq: [
+                          { $toString: "$subject_id" },
+                          { $toString: "$$id" }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              },
               { $sort: { created_at: -1, _id: -1 } },
               { $limit: 1 },
               { $project: { _id: 0, url: 1 } }
@@ -198,8 +231,21 @@ module.exports = async (req, res) => {
           from: "photos",
           let: { id: "$_id" },
           pipeline: [
-            { $match: { $and: [{ $expr: { $eq: ["$owner", "$$id"] } }, { primary: true }] } },
-            // FIX: inclusion-only projection
+            {
+              $match: {
+                $and: [
+                  {
+                    $expr: {
+                      $eq: [
+                        { $toString: "$owner" },
+                        { $toString: "$$id" }
+                      ]
+                    }
+                  },
+                  { primary: true }
+                ]
+              }
+            },
             { $project: { _id: 0, url: 1 } }
           ],
           as: "officerPics"
