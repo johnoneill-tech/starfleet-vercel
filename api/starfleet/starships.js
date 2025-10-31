@@ -20,19 +20,20 @@ module.exports = async (req, res) => {
     const u = new URL(req.url || req.originalUrl || "/", "http://local");
     const id = u.searchParams.get("id");
 
+    // ---------- DETAIL ----------
     if (id) {
       if (!/^[0-9a-fA-F]{24}$/.test(id)) { res.statusCode = 400; res.setHeader("content-type","application/json; charset=utf-8"); return res.end(JSON.stringify({ message: "Invalid id" })); }
 
       const pipeline = [
         { $match: { _id: new ObjectId(id) } },
 
-        // photos: primary first, then newest any
+        // photos: primary then newest-any
         {
           $lookup: {
             from: "photos",
             let: { id: "$_id" },
             pipeline: [
-              { $match: { $and: [ { $expr: { $eq: ["$owner", "$$id"] } }, { primary: true } ] } },
+              { $match: { $and: [{ $expr: { $eq: ["$owner", "$$id"] } }, { primary: true }] } },
               { $project: { _id: 0, url: 1 } }
             ],
             as: "primaryPics"
@@ -43,7 +44,7 @@ module.exports = async (req, res) => {
             from: "photos",
             let: { id: "$_id" },
             pipeline: [
-              { $match: { $expr: { $or: [ { $eq: ["$owner", "$$id"] }, { $eq: ["$subject_id", "$$id"] } ] } } },
+              { $match: { $expr: { $or: [{ $eq: ["$owner", "$$id"] }, { $eq: ["$subject_id", "$$id"] }] } } },
               { $sort: { created_at: -1, _id: -1 } },
               { $limit: 1 },
               { $project: { _id: 0, url: 1 } }
@@ -55,11 +56,11 @@ module.exports = async (req, res) => {
           $addFields: {
             picUrl: {
               $cond: [
-                { $gt: [ { $size: "$primaryPics" }, 0 ] },
+                { $gt: [{ $size: "$primaryPics" }, 0] },
                 "$primaryPics.url",
                 {
                   $cond: [
-                    { $gt: [ { $size: "$fallbackPics" }, 0 ] },
+                    { $gt: [{ $size: "$fallbackPics" }, 0] },
                     "$fallbackPics.url",
                     []
                   ]
@@ -70,13 +71,13 @@ module.exports = async (req, res) => {
         },
         { $project: { primaryPics: 0, fallbackPics: 0 } },
 
-        // personnelCount (same as before)
+        // counts
         {
           $lookup: {
             from: "events",
             let: { id: "$_id" },
             pipeline: [
-              { $match: { $and: [ { $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Assignment" } ] } },
+              { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Assignment" }] } },
               { $group: { _id: "$officerId" } },
               { $count: "personnelNum" }
             ],
@@ -85,14 +86,12 @@ module.exports = async (req, res) => {
         },
         { $addFields: { personnelCount: "$personnelAssignments.personnelNum" } },
         { $project: { personnelAssignments: 0 } },
-
-        // missionCount (same as before)
         {
           $lookup: {
             from: "events",
             let: { id: "$_id" },
             pipeline: [
-              { $match: { $and: [ { $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Mission" }, { officerId: { $exists: false } } ] } },
+              { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Mission" }, { officerId: { $exists: false } }] } },
               { $count: "missonNum" }
             ],
             as: "missions"
@@ -116,7 +115,7 @@ module.exports = async (req, res) => {
       return res.end(JSON.stringify(doc));
     }
 
-    // LIST (unchanged parity with envelope)
+    // ---------- LIST ----------
     let starshipsPerPage = parseInt(u.searchParams.get("starshipsPerPage") || "12", 10);
     const page = parseInt(u.searchParams.get("page") || "0", 10);
     const name = (u.searchParams.get("name") || "").trim();
@@ -129,7 +128,7 @@ module.exports = async (req, res) => {
     let classQuery = {};
     if (klass && klass !== "All") {
       if (klass === "Unknown") {
-        classQuery = { $or: [ { class: { $exists: false } }, { class: null }, { class: "" } ] };
+        classQuery = { $or: [{ class: { $exists: false } }, { class: null }, { class: "" }] };
       } else {
         classQuery = { class: { $regex: "^" + escRe(klass) + "$", $options: "i" } };
       }
@@ -140,9 +139,13 @@ module.exports = async (req, res) => {
     if (timeframe === "23rd") { startTimeFrame = 400; endTimeFrame = 2500; }
     if (timeframe === "24th") { startTimeFrame = 2500; endTimeFrame = 110000; }
     if (timeframe === "32nd") { startTimeFrame = 110000; endTimeFrame = 999999; }
-    const timeQuery = { $and: [ { ship_id: { $gte: startTimeFrame } }, { ship_id: { $lt: endTimeFrame } } ] };
+    const timeQuery = { $and: [{ ship_id: { $gte: startTimeFrame } }, { ship_id: { $lt: endTimeFrame } }] };
 
-    const query = { $and: [ nameQuery, classQuery, timeQuery ] };
+    const and = [];
+    if (Object.keys(nameQuery).length) and.push(nameQuery);
+    if (Object.keys(classQuery).length) and.push(classQuery);
+    and.push(timeQuery);
+    const query = and.length ? { $and: and } : { _id: { $exists: true } };
 
     const list = await col.aggregate([
       { $match: query },
@@ -151,8 +154,9 @@ module.exports = async (req, res) => {
           from: "photos",
           let: { id: "$_id" },
           pipeline: [
-            { $match: { $and: [ { $expr: { $eq: ["$owner", "$$id"] } }, { primary: true } ] } },
-            { $project: { _id: 0, title: 0, description: 0, owner: 0, url: 1 } }
+            { $match: { $and: [{ $expr: { $eq: ["$owner", "$$id"] } }, { primary: true }] } },
+            // FIX: inclusion-only projection
+            { $project: { _id: 0, url: 1 } }
           ],
           as: "shipPics"
         }
@@ -160,11 +164,11 @@ module.exports = async (req, res) => {
       { $addFields: { picUrl: "$shipPics.url" } },
       { $project: { shipPics: 0 } },
       {
-        $lookup: { // quick count joins, same as detail
+        $lookup: {
           from: "events",
           let: { id: "$_id" },
           pipeline: [
-            { $match: { $and: [ { $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Assignment" } ] } },
+            { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Assignment" }] } },
             { $group: { _id: "$officerId" } },
             { $count: "personnelNum" }
           ],
@@ -178,7 +182,7 @@ module.exports = async (req, res) => {
           from: "events",
           let: { id: "$_id" },
           pipeline: [
-            { $match: { $and: [ { $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Mission" }, { officerId: { $exists: false } } ] } },
+            { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Mission" }, { officerId: { $exists: false } }] } },
             { $count: "missonNum" }
           ],
           as: "missions"
