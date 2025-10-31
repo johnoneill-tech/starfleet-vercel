@@ -2,147 +2,199 @@
 const { getDb } = require("../../src/db");
 const { ObjectId } = require("bson");
 
-/* ------------ tiny utils ------------ */
-function json(res, status, data) {
-  res.statusCode = status;
-  res.setHeader("content-type", "application/json; charset=utf-8");
-  res.end(JSON.stringify(data));
+function isHex24(s) { return typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s); }
+function oidOrString(v) { return isHex24(v) ? new ObjectId(v) : v; }
+function asBool(v) {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "string") return v.toLowerCase() === "true";
+  if (typeof v === "number") return v !== 0;
+  return false;
 }
 
-function parseUrl(req) {
-  try {
-    return new URL(req.url || req.originalUrl || "/", "http://local");
-  } catch {
-    return new URL("/", "http://local");
-  }
-}
-
-async function readJsonBody(req) {
-  if (req.body && typeof req.body === "object") return req.body; // sometimes provided by platform
-  if (req.body && typeof req.body === "string") {
-    try { return JSON.parse(req.body); } catch { return {}; }
-  }
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const raw = Buffer.concat(chunks).toString("utf8");
-  if (!raw) return {};
-  try { return JSON.parse(raw); } catch { return {}; }
-}
-
-function toObjectId(id, field = "id") {
-  try { return new ObjectId(String(id)); }
-  catch { throw new Error(`Invalid ${field}: must be a 24-hex ObjectId string`); }
-}
-
-/* ------------ handler ------------ */
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
+  if (method === "OPTIONS") { res.statusCode = 204; return res.end(); }
 
   try {
     const db = await getDb();
     const col = db.collection("photos");
 
-    // ROUTING
+    // Parse URL & body safely
+    const u = new URL(req.url || req.originalUrl || "/", "http://local");
+    const id = u.searchParams.get("id");
+    const subject_id = u.searchParams.get("subject_id") || u.searchParams.get("owner_id");
+    const body = req.body || {};
+
+    // ---------- GET ----------
     if (method === "GET") {
-      const u = parseUrl(req);
-      const id = u.searchParams.get("id");
-      const subject_id = u.searchParams.get("subject_id");
-      const limit = Math.max(0, Math.min(parseInt(u.searchParams.get("limit") || "50", 10), 200));
-      const page = Math.max(0, parseInt(u.searchParams.get("page") || "0", 10));
-      const skip = page * limit;
-
-      // GET by id → single URL (and id for convenience)
+      // Single photo by id
       if (id) {
-        const _id = toObjectId(id, "id");
-        const doc = await col.findOne({ _id }, { projection: { _id: 1, url: 1 } });
-        if (!doc) return json(res, 404, { ok: false, error: "Not Found" });
-        return json(res, 200, { ok: true, id: String(doc._id), url: doc.url || null });
+        if (!isHex24(id)) {
+          res.statusCode = 400;
+          res.setHeader("content-type", "application/json; charset=utf-8");
+          return res.end(JSON.stringify({ message: "Invalid id" }));
+        }
+        const doc = await col.findOne(
+          { _id: new ObjectId(id) },
+          { projection: { url: 1, title: 1, description: 1, year: 1, primary: 1 } }
+        );
+        if (!doc) {
+          res.statusCode = 404;
+          res.setHeader("content-type", "application/json; charset=utf-8");
+          return res.end(JSON.stringify({ message: "Not Found" }));
+        }
+        doc._id = String(doc._id);
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify(doc));
       }
 
-      // GET list by subject_id → array of URLs (id optional in query param controls)
-      const filter = {};
-      if (subject_id) filter.subject_id = toObjectId(subject_id, "subject_id");
+      // All photos for a subject (subject_id or owner_id)
+      if (!subject_id) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Missing subject_id" }));
+      }
 
-      // only return string, non-empty urls
-      const cursor = col
-        .find(filter, { projection: { _id: 1, url: 1 } })
-        .sort({ _id: -1 })
-        .skip(skip)
-        .limit(limit);
+      // Match photos whose owner/subject_id equals the given subject (compare as strings)
+      const pipeline = [
+        {
+          $match: {
+            $expr: {
+              $or: [
+                { $eq: [ { $toString: "$owner" }, { $toString: subject_id } ] },
+                { $eq: [ { $toString: "$subject_id" }, { $toString: subject_id } ] }
+              ]
+            }
+          }
+        },
+        // Sort: primary first, then newest (created_at desc, _id desc)
+        { $sort: { primary: -1, created_at: -1, _id: -1 } },
+        { $project: { url: 1, title: 1, description: 1, year: 1, primary: 1 } }
+      ];
 
-      const docs = await cursor.toArray();
-      // By default return just URLs; if you ever need ids too, flip the map below
-      const urls = docs.map(d => d?.url).filter(u => typeof u === "string" && u.length > 0);
-      return json(res, 200, urls);
+      const items = await col.aggregate(pipeline).toArray();
+      items.forEach(p => { if (p._id) p._id = String(p._id); });
+
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      return res.end(JSON.stringify(items));
     }
 
+    // ---------- POST ----------
     if (method === "POST") {
-      const body = await readJsonBody(req);
-      const url = (body.url || "").trim();
-      if (!url) return json(res, 400, { ok: false, error: "url is required" });
-
-      let subject_id = null;
-      if (body.subject_id) subject_id = toObjectId(body.subject_id, "subject_id");
-
-      const doc = { url };
-      if (subject_id) doc.subject_id = subject_id;
-      if (typeof body.caption === "string") doc.caption = body.caption;
-      if (typeof body.source === "string") doc.source = body.source;
-      if (Array.isArray(body.tags)) doc.tags = body.tags.filter(t => typeof t === "string" && t.length > 0);
-
-      // Optional: timestamps
-      const now = new Date();
-      doc.created_at = now;
-      doc.updated_at = now;
-
-      const r = await col.insertOne(doc);
-      return json(res, 201, { ok: true, id: String(r.insertedId), url: doc.url });
-    }
-
-    if (method === "PUT" || method === "PATCH") {
-      const body = await readJsonBody(req);
-      if (!body.id) return json(res, 400, { ok: false, error: "id is required" });
-      const _id = toObjectId(body.id, "id");
-
-      const $set = { updated_at: new Date() };
-      if (typeof body.url === "string") $set.url = body.url.trim();
-      if (typeof body.caption === "string") $set.caption = body.caption;
-      if (typeof body.source === "string") $set.source = body.source;
-      if (Array.isArray(body.tags)) $set.tags = body.tags.filter(t => typeof t === "string" && t.length > 0);
-      if (body.subject_id !== undefined) {
-        $set.subject_id = body.subject_id ? toObjectId(body.subject_id, "subject_id") : undefined;
+      // Expect: { subject_id/owner, url, title?, description?, year?, primary? }
+      const ownerRaw = body.owner ?? body.subject_id;
+      const url = body.url;
+      if (!ownerRaw || !url) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "owner/subject_id and url are required" }));
       }
 
-      // remove undefined fields from $set
-      Object.keys($set).forEach(k => $set[k] === undefined && delete $set[k]);
+      const doc = {
+        owner: oidOrString(ownerRaw),
+        url: String(url),
+        title: body.title ? String(body.title) : "",
+        description: body.description ? String(body.description) : "",
+        year: body.year ? String(body.year) : "",
+        primary: asBool(body.primary),
+        created_at: new Date()
+      };
 
-      if (Object.keys($set).length === 1) { // only updated_at present
-        return json(res, 400, { ok: false, error: "No updatable fields provided" });
+      // If setting primary, clear other primaries for this owner up front
+      if (doc.primary === true) {
+        await col.updateMany(
+          {
+            $expr: {
+              $eq: [ { $toString: "$owner" }, { $toString: String(ownerRaw) } ]
+            }
+          },
+          { $set: { primary: false } }
+        );
       }
 
-      const r = await col.updateOne({ _id }, { $set });
-      if (r.matchedCount === 0) return json(res, 404, { ok: false, error: "Not Found" });
-
-      // return the updated url (convenience)
-      const doc = await col.findOne({ _id }, { projection: { _id: 1, url: 1 } });
-      return json(res, 200, { ok: true, id: String(_id), url: doc?.url || null });
+      const result = await col.insertOne(doc);
+      res.statusCode = 201;
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      return res.end(JSON.stringify({ ok: true, _id: String(result.insertedId) }));
     }
 
+    // ---------- PUT ----------
+    if (method === "PUT") {
+      // Accept either id in query or in body
+      const pid = id || body.id || body._id;
+      if (!pid || !isHex24(pid)) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Valid id is required" }));
+      }
+
+      const update = {};
+      if (body.url != null) update.url = String(body.url);
+      if (body.title != null) update.title = String(body.title);
+      if (body.description != null) update.description = String(body.description);
+      if (body.year != null) update.year = String(body.year);
+      if (body.primary != null) update.primary = asBool(body.primary);
+      if (body.owner != null || body.subject_id != null) {
+        update.owner = oidOrString(body.owner ?? body.subject_id);
+      }
+
+      // If toggling primary true, unset others for that owner before setting
+      if (update.primary === true) {
+        // fetch existing to know owner
+        const existing = await col.findOne({ _id: new ObjectId(pid) }, { projection: { owner: 1 } });
+        const effOwner = update.owner ?? existing?.owner;
+        if (effOwner) {
+          await col.updateMany(
+            {
+              $and: [
+                { _id: { $ne: new ObjectId(pid) } },
+                {
+                  $expr: {
+                    $eq: [ { $toString: "$owner" }, { $toString: String(effOwner) } ]
+                  }
+                }
+              ]
+            },
+            { $set: { primary: false } }
+          );
+        }
+      }
+
+      if (Object.keys(update).length === 0) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "No fields to update" }));
+      }
+
+      await col.updateOne({ _id: new ObjectId(pid) }, { $set: update });
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      return res.end(JSON.stringify({ ok: true }));
+    }
+
+    // ---------- DELETE ----------
     if (method === "DELETE") {
-      const u = parseUrl(req);
-      const id = u.searchParams.get("id");
-      if (!id) return json(res, 400, { ok: false, error: "id is required" });
-
-      const _id = toObjectId(id, "id");
-      const r = await col.deleteOne({ _id });
-      if (r.deletedCount === 0) return json(res, 404, { ok: false, error: "Not Found" });
-      return json(res, 200, { ok: true, id: String(_id) });
+      if (!id || !isHex24(id)) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Valid id is required" }));
+      }
+      await col.deleteOne({ _id: new ObjectId(id) });
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      return res.end(JSON.stringify({ ok: true }));
     }
 
-    // Method not allowed
-    res.setHeader("Allow", "GET, POST, PUT, PATCH, DELETE");
-    return json(res, 405, { ok: false, error: "Method Not Allowed" });
+    // Fallback
+    res.statusCode = 405;
+    res.setHeader("Allow", "GET, POST, PUT, DELETE, OPTIONS");
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    return res.end(JSON.stringify({ message: "Method Not Allowed" }));
   } catch (e) {
-    return json(res, 500, { ok: false, error: e.message });
+    res.statusCode = 500;
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    return res.end(JSON.stringify({ message: e.message || "Internal error" }));
   }
 };

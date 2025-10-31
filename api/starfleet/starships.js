@@ -20,14 +20,18 @@ module.exports = async (req, res) => {
     const u = new URL(req.url || req.originalUrl || "/", "http://local");
     const id = u.searchParams.get("id");
 
-    // ---------- DETAIL ----------
+    // ---------- DETAIL (returns full doc with picUrl: string[]) ----------
     if (id) {
-      if (!/^[0-9a-fA-F]{24}$/.test(id)) { res.statusCode = 400; res.setHeader("content-type","application/json; charset=utf-8"); return res.end(JSON.stringify({ message: "Invalid id" })); }
+      if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+        res.statusCode = 400;
+        res.setHeader("content-type","application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Invalid id" }));
+      }
 
       const pipeline = [
         { $match: { _id: new ObjectId(id) } },
 
-        // photos: compare as strings (owner/subject_id may be string or ObjectId)
+        // photos: primary[] first, then newest others[]; compare as strings
         {
           $lookup: {
             from: "photos",
@@ -48,6 +52,7 @@ module.exports = async (req, res) => {
                   ]
                 }
               },
+              { $sort: { created_at: -1, _id: -1 } },
               { $project: { _id: 0, url: 1 } }
             ],
             as: "primaryPics"
@@ -79,32 +84,36 @@ module.exports = async (req, res) => {
                 }
               },
               { $sort: { created_at: -1, _id: -1 } },
-              { $limit: 1 },
-              { $project: { _id: 0, url: 1 } }
+              { $project: { _id: 0, url: 1, primary: 1 } }
             ],
-            as: "fallbackPics"
+            as: "allPics"
           }
         },
         {
           $addFields: {
             picUrl: {
-              $cond: [
-                { $gt: [{ $size: "$primaryPics" }, 0] },
-                "$primaryPics.url",
+              $concatArrays: [
+                { $ifNull: ["$primaryPics.url", []] },
                 {
-                  $cond: [
-                    { $gt: [{ $size: "$fallbackPics" }, 0] },
-                    "$fallbackPics.url",
-                    []
-                  ]
+                  $map: {
+                    input: {
+                      $filter: {
+                        input: "$allPics",
+                        as: "p",
+                        cond: { $ne: ["$$p.primary", true] }
+                      }
+                    },
+                    as: "p",
+                    in: "$$p.url"
+                  }
                 }
               ]
             }
           }
         },
-        { $project: { primaryPics: 0, fallbackPics: 0 } },
+        { $project: { primaryPics: 0, allPics: 0 } },
 
-        // counts (unchanged)
+        // counts
         {
           $lookup: {
             from: "events",
@@ -148,7 +157,7 @@ module.exports = async (req, res) => {
       return res.end(JSON.stringify(doc));
     }
 
-    // ---------- LIST ----------
+    // ---------- LIST (primary only; fast) ----------
     let starshipsPerPage = parseInt(u.searchParams.get("starshipsPerPage") || "12", 10);
     const page = parseInt(u.searchParams.get("page") || "0", 10);
     const name = (u.searchParams.get("name") || "").trim();

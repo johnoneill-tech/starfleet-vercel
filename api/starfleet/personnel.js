@@ -22,7 +22,7 @@ module.exports = async (req, res) => {
     const u = new URL(req.url || req.originalUrl || "/", "http://local");
     const id = u.searchParams.get("id");
 
-    // ---------- DETAIL ----------
+    // ---------- DETAIL (returns full doc with picUrl: string[]) ----------
     if (id) {
       if (!isHex24(id)) {
         res.statusCode = 400;
@@ -33,7 +33,7 @@ module.exports = async (req, res) => {
       const pipeline = [
         { $match: { _id: new ObjectId(id) } },
 
-        // lastAssignment with ship
+        // lastAssignment + ship name/registry
         {
           $lookup: {
             from: "events",
@@ -70,7 +70,7 @@ module.exports = async (req, res) => {
         { $replaceRoot: { newRoot: { $mergeObjects: [{ $arrayElemAt: ["$lastAssignment", 0] }, "$$ROOT"] } } },
         { $project: { lastAssignment: 0 } },
 
-        // counts
+        // aggregate counts
         {
           $lookup: {
             from: "events",
@@ -125,7 +125,7 @@ module.exports = async (req, res) => {
         { $addFields: { lifeEventCount: "$lifeEvents.lifeEventsNum" } },
         { $project: { lifeEvents: 0 } },
 
-        // photos: compare as strings (handles owner stored as ObjectId or string)
+        // ---- PHOTOS (ARRAY): primary[] first, then newest others[]; compare as strings ----
         {
           $lookup: {
             from: "photos",
@@ -146,6 +146,7 @@ module.exports = async (req, res) => {
                   ]
                 }
               },
+              { $sort: { created_at: -1, _id: -1 } },
               { $project: { _id: 0, url: 1 } }
             ],
             as: "primaryPics"
@@ -177,30 +178,35 @@ module.exports = async (req, res) => {
                 }
               },
               { $sort: { created_at: -1, _id: -1 } },
-              { $limit: 1 },
-              { $project: { _id: 0, url: 1 } }
+              { $project: { _id: 0, url: 1, primary: 1 } }
             ],
-            as: "fallbackPics"
+            as: "allPics"
           }
         },
+        // Build picUrl = [primary urls...] + [non-primary urls...], no duplicates
         {
           $addFields: {
             picUrl: {
-              $cond: [
-                { $gt: [{ $size: "$primaryPics" }, 0] },
-                "$primaryPics.url",
+              $concatArrays: [
+                { $ifNull: ["$primaryPics.url", []] },
                 {
-                  $cond: [
-                    { $gt: [{ $size: "$fallbackPics" }, 0] },
-                    "$fallbackPics.url",
-                    []
-                  ]
+                  $map: {
+                    input: {
+                      $filter: {
+                        input: "$allPics",
+                        as: "p",
+                        cond: { $ne: ["$$p.primary", true] }
+                      }
+                    },
+                    as: "p",
+                    in: "$$p.url"
+                  }
                 }
               ]
             }
           }
         },
-        { $project: { primaryPics: 0, fallbackPics: 0 } }
+        { $project: { primaryPics: 0, allPics: 0 } }
       ];
 
       let doc = await col.aggregate(pipeline).next();
@@ -215,7 +221,7 @@ module.exports = async (req, res) => {
       return res.end(JSON.stringify(doc));
     }
 
-    // ---------- LIST ----------
+    // ---------- LIST (primary only; fast) ----------
     const personnelPerPage = parseInt(u.searchParams.get("personnelPerPage") || "10", 10);
     const page = parseInt(u.searchParams.get("page") || "0", 10);
     const name = (u.searchParams.get("name") || "").trim();
