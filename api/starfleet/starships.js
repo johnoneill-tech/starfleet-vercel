@@ -3,9 +3,7 @@ const { getDb } = require("../../src/db");
 const { ObjectId } = require("bson");
 
 function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-
 function timeframeMatch(tf) {
-  // Accept "all" (or empty) to mean no filter
   if (!tf || tf.toLowerCase() === "all") return {};
   if (tf === "22nd") return { ship_id: { $lt: 400 } };
   if (tf === "23rd") return { ship_id: { $gte: 400, $lt: 2500 } };
@@ -17,11 +15,8 @@ function timeframeMatch(tf) {
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
 
-  // Preflight handled here; CORS headers come from vercel.json
-  if (method === "OPTIONS") {
-    res.statusCode = 204;
-    return res.end();
-  }
+  // Preflight
+  if (method === "OPTIONS") { res.statusCode = 204; return res.end(); }
 
   try {
     const db = await getDb();
@@ -37,22 +32,23 @@ module.exports = async (req, res) => {
     const u = new URL(req.url || req.originalUrl || "/", "http://local");
     const id = u.searchParams.get("id");
 
-    // Single doc branch (detail pages)
+    // ---------- DETAIL BRANCH ----------
     if (id) {
       const _id = new ObjectId(String(id));
       const doc = await col.aggregate([
         { $match: { _id } },
+
+        // Primary photo
         {
           $lookup: {
             from: "photos",
             let: { ownerId: "$_id" },
             pipeline: [
-              {
-                $match: {
+              { $match: {
                   $expr: {
                     $or: [
                       { $eq: ["$owner", "$$ownerId"] },
-                      { $eq: ["$subject_id", "$$ownerId"] } // support either FK field
+                      { $eq: ["$subject_id", "$$ownerId"] }
                     ]
                   }
                 }
@@ -64,18 +60,109 @@ module.exports = async (req, res) => {
             as: "primaryPhoto"
           }
         },
+
+        // Assignments for this ship (crew), joined with officer info
+        {
+          $lookup: {
+            from: "assignments",
+            let: { shipId: "$_id" },
+            pipeline: [
+              { $match: {
+                  $expr: {
+                    $or: [
+                      { $eq: ["$starship_id", "$$shipId"] },
+                      { $eq: ["$ship_id", "$$shipId"] }
+                    ]
+                  }
+                }
+              },
+              { $sort: { from_date: -1, _id: -1 } },
+              { $limit: 200 },
+              {
+                $lookup: {
+                  from: "officers",
+                  let: { personId: "$personnel_id" },
+                  pipeline: [
+                    { $match: {
+                        $expr: {
+                          $or: [
+                            { $eq: ["$_id", "$$personId"] },
+                            { $eq: ["$officer_id", "$$personId"] } // alternate FK
+                          ]
+                        }
+                      }
+                    },
+                    { $project: { _id: 1, first: 1, middle: 1, surname: 1, name: 1, rank: 1, division: 1 } }
+                  ],
+                  as: "person"
+                }
+              },
+              { $addFields: { person: { $ifNull: [ { $arrayElemAt: ["$person", 0] }, null ] } } },
+              { $project: { _id: 1, role: 1, from_date: 1, to_date: 1, person: 1 } }
+            ],
+            as: "crewAssignments"
+          }
+        },
+
+        // Current crew = no to_date
+        {
+          $addFields: {
+            currentCrew: {
+              $filter: {
+                input: "$crewAssignments",
+                as: "a",
+                cond: { $or: [ { $eq: ["$$a.to_date", null] }, { $not: ["$$a.to_date"] } ] }
+              }
+            },
+            currentCrewCount: {
+              $size: {
+                $filter: {
+                  input: "$crewAssignments",
+                  as: "a",
+                  cond: { $or: [ { $eq: ["$$a.to_date", null] }, { $not: ["$$a.to_date"] } ] }
+                }
+              }
+            }
+          }
+        },
+
+        // Recent events for this ship
+        {
+          $lookup: {
+            from: "events",
+            let: { shipId: "$_id" },
+            pipeline: [
+              { $match: {
+                  $expr: {
+                    $or: [
+                      { $eq: ["$starship_id", "$$shipId"] },
+                      { $in: ["$$shipId", "$ships"] },
+                      { $in: ["$$shipId", "$subjects"] }
+                    ]
+                  }
+                }
+              },
+              { $sort: { date: -1, _id: -1 } },
+              { $limit: 10 },
+              { $project: { _id: 1, name: 1, title: 1, date: 1, type: 1 } }
+            ],
+            as: "recentEvents"
+          }
+        },
+
+        // Normalize picUrl; project final
         {
           $addFields: {
             picUrl: {
               $cond: [
-                { $gt: [{ $size: "$primaryPhoto" }, 0] },
-                [{ $arrayElemAt: ["$primaryPhoto.url", 0] }],
+                { $gt: [ { $size: "$primaryPhoto" }, 0 ] },
+                [ { $arrayElemAt: ["$primaryPhoto.url", 0] } ],
                 []
               ]
             }
           }
         },
-        { $project: { _id: 1, name: 1, class: 1, registry: 1, ship_id: 1, picUrl: 1 } }
+        { $project: { _id: 1, name: 1, class: 1, registry: 1, ship_id: 1, picUrl: 1, crewAssignments: 1, currentCrew: 1, currentCrewCount: 1, recentEvents: 1 } }
       ]).next();
 
       if (!doc) {
@@ -84,24 +171,23 @@ module.exports = async (req, res) => {
         return res.end(JSON.stringify({ ok: false, error: "Not Found" }));
       }
 
+      const out = { ...doc, _id: String(doc._id) };
       res.statusCode = 200;
       res.setHeader("content-type", "application/json; charset=utf-8");
-      return res.end(JSON.stringify({ ok: true, ...doc, _id: String(doc._id) }));
+      return res.end(JSON.stringify({ ok: true, ...out }));
     }
+    // ---------- END DETAIL BRANCH ----------
 
-    // List / search branch (used by SearchList)
-    const name = (u.searchParams.get("name") || "").trim();      // prefix on name
+    // ---------- LIST / SEARCH BRANCH (legacy envelope) ----------
+    const name = (u.searchParams.get("name") || "").trim();      // prefix
     const klass = (u.searchParams.get("class") || "").trim();    // All / Unknown / exact
     const timeframe = (u.searchParams.get("timeframe") || "").trim(); // 22nd/23rd/24th/32nd or "all"
     const perPage = Math.max(1, Math.min(parseInt(u.searchParams.get("starshipsPerPage") || "12", 10), 200));
     const page = Math.max(0, parseInt(u.searchParams.get("page") || "0", 10));
     const skip = page * perPage;
 
-    // Build filter to match Realm behavior
     const filter = {};
-    if (name) {
-      filter.name = { $regex: "^" + escRe(name) + ".*", $options: "i" }; // prefix
-    }
+    if (name) filter.name = { $regex: "^" + escRe(name) + ".*", $options: "i" };
     if (klass) {
       if (klass === "All") {
         // no-op
@@ -114,7 +200,7 @@ module.exports = async (req, res) => {
         if (filter.$or) filter.$or.push(...unknown);
         else filter.$or = unknown;
       } else {
-        filter.class = { $regex: "^" + escRe(klass) + "$", $options: "i" }; // exact (ci)
+        filter.class = { $regex: "^" + escRe(klass) + "$", $options: "i" };
       }
     }
     Object.assign(filter, timeframeMatch(timeframe));
@@ -162,10 +248,7 @@ module.exports = async (req, res) => {
       { $project: { _id: 1, name: 1, class: 1, registry: 1, ship_id: 1, picUrl: 1 } }
     ]).toArray();
 
-    const starships = docs.map(d => ({
-      ...d,
-      _id: String(d._id) // ensure string
-    }));
+    const starships = docs.map(d => ({ ...d, _id: String(d._id) }));
 
     res.statusCode = 200;
     res.setHeader("content-type", "application/json; charset=utf-8");
@@ -175,6 +258,7 @@ module.exports = async (req, res) => {
       entries_per_page: perPage,
       total_results: total
     }));
+    // ---------- END LIST BRANCH ----------
   } catch (e) {
     res.statusCode = 500;
     res.setHeader("content-type", "application/json; charset=utf-8");
