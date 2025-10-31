@@ -2,31 +2,11 @@
 const { getDb } = require("../../src/db");
 const { ObjectId } = require("bson");
 
-/* utils */
-function json(res, status, data) {
-  res.statusCode = status;
-  res.setHeader("content-type", "application/json; charset=utf-8");
-  res.end(JSON.stringify(data));
-}
-function parseUrl(req) {
-  try { return new URL(req.url || req.originalUrl || "/", "http://local"); }
-  catch { return new URL("/", "http://local"); }
-}
-async function readJsonBody(req) {
-  if (req.body && typeof req.body === "object") return req.body;
-  if (typeof req.body === "string") { try { return JSON.parse(req.body); } catch { return {}; } }
-  const chunks = []; for await (const c of req) chunks.push(c);
-  const raw = Buffer.concat(chunks).toString("utf8");
-  if (!raw) return {}; try { return JSON.parse(raw); } catch { return {}; }
-}
-function toObjectId(id, field = "id") {
-  try { return new ObjectId(String(id)); }
-  catch { throw new Error(`Invalid ${field}: must be a 24-hex ObjectId string`); }
-}
 function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 
 function timeframeMatch(tf) {
-  if (!tf) return {};
+  // Accept "all" (or empty) to mean no filter
+  if (!tf || tf.toLowerCase() === "all") return {};
   if (tf === "22nd") return { ship_id: { $lt: 400 } };
   if (tf === "23rd") return { ship_id: { $gte: 400, $lt: 2500 } };
   if (tf === "24th") return { ship_id: { $gte: 2500, $lt: 110000 } };
@@ -36,146 +16,168 @@ function timeframeMatch(tf) {
 
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
+
+  // Preflight handled here; CORS headers come from vercel.json
+  if (method === "OPTIONS") {
+    res.statusCode = 204;
+    return res.end();
+  }
+
   try {
     const db = await getDb();
     const col = db.collection("starships");
 
-    if (method === "GET") {
-      const u = parseUrl(req);
-      const id = u.searchParams.get("id");
-      const name = (u.searchParams.get("name") || "").trim();    // prefix on name
-      const klass = (u.searchParams.get("class") || "").trim();  // All / Unknown / exact
-      const timeframe = (u.searchParams.get("timeframe") || "").trim(); // 22nd/23rd/24th/32nd
+    if (method !== "GET") {
+      res.statusCode = 405;
+      res.setHeader("Allow", "GET, OPTIONS");
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+    }
 
-      const perPage = Math.max(1, Math.min(parseInt(u.searchParams.get("starshipsPerPage") || "12", 10), 200));
-      const page = Math.max(0, parseInt(u.searchParams.get("page") || "0", 10));
-      const skip = page * perPage;
+    const u = new URL(req.url || req.originalUrl || "/", "http://local");
+    const id = u.searchParams.get("id");
 
-      if (id) {
-        const _id = toObjectId(id, "id");
-        const doc = await col.aggregate([
-          { $match: { _id } },
-          { $lookup: {
-              from: "photos",
-              let: { ownerId: "$_id" },
-              pipeline: [
-                { $match: { $expr: { $eq: ["$owner", "$$ownerId"] } } },
-                { $sort: { created_at: -1, _id: -1 } },
-                { $limit: 1 },
-                { $project: { _id: 0, url: 1 } }
-              ],
-              as: "primaryPhoto"
-          }},
-          { $addFields: { picUrl: { $ifNull: [ { $arrayElemAt: ["$primaryPhoto.url", 0] }, null ] } } },
-          { $project: { _id: 1, name: 1, class: 1, registry: 1, ship_id: 1, picUrl: 1 } }
-        ]).next();
-
-        if (!doc) return json(res, 404, { ok: false, error: "Not Found" });
-        return json(res, 200, { ok: true, id: String(doc._id), ...doc, _id: undefined });
-      }
-
-      // Build filter
-      const filter = {};
-      if (name) filter.name = { $regex: "^" + escRe(name) + ".*", $options: "i" }; // prefix
-      if (klass) {
-        if (klass === "All") {
-          // no class constraint
-        } else if (klass === "Unknown") {
-          filter.$or = [
-            ...(filter.$or || []),
-            { class: { $exists: false } },
-            { class: null },
-            { class: "" }
-          ];
-        } else {
-          filter.class = { $regex: "^" + escRe(klass) + "$", $options: "i" }; // exact (ci)
-        }
-      }
-      Object.assign(filter, timeframeMatch(timeframe));
-
-      const docs = await col.aggregate([
-        { $match: filter },
-        { $sort: { ship_id: 1, _id: 1 } },
-        { $skip: skip },
-        { $limit: perPage },
-        { $lookup: {
+    // Single doc branch (detail pages)
+    if (id) {
+      const _id = new ObjectId(String(id));
+      const doc = await col.aggregate([
+        { $match: { _id } },
+        {
+          $lookup: {
             from: "photos",
             let: { ownerId: "$_id" },
             pipeline: [
-              { $match: { $expr: { $eq: ["$owner", "$$ownerId"] } } },
+              {
+                $match: {
+                  $expr: {
+                    $or: [
+                      { $eq: ["$owner", "$$ownerId"] },
+                      { $eq: ["$subject_id", "$$ownerId"] } // support either FK field
+                    ]
+                  }
+                }
+              },
               { $sort: { created_at: -1, _id: -1 } },
               { $limit: 1 },
               { $project: { _id: 0, url: 1 } }
             ],
             as: "primaryPhoto"
-        }},
-        { $addFields: { picUrl: { $ifNull: [ { $arrayElemAt: ["$primaryPhoto.url", 0] }, null ] } } },
+          }
+        },
+        {
+          $addFields: {
+            picUrl: {
+              $cond: [
+                { $gt: [{ $size: "$primaryPhoto" }, 0] },
+                [{ $arrayElemAt: ["$primaryPhoto.url", 0] }],
+                []
+              ]
+            }
+          }
+        },
         { $project: { _id: 1, name: 1, class: 1, registry: 1, ship_id: 1, picUrl: 1 } }
-      ]).toArray();
+      ]).next();
 
-      const items = docs.map(d => ({
-        id: String(d._id),
-        name: d.name,
-        class: d.class,
-        registry: d.registry,
-        ship_id: d.ship_id,
-        picUrl: d.picUrl
-      }));
-      return json(res, 200, items);
+      if (!doc) {
+        res.statusCode = 404;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ ok: false, error: "Not Found" }));
+      }
+
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      return res.end(JSON.stringify({ ok: true, ...doc, _id: String(doc._id) }));
     }
 
-    // Mutations preserved from earlier (POST/PUT/PATCH/DELETE)
-    if (method === "POST") {
-      const body = await readJsonBody(req);
-      const name = (body.name || "").trim();
-      if (!name) return json(res, 400, { ok: false, error: "name is required" });
+    // List / search branch (used by SearchList)
+    const name = (u.searchParams.get("name") || "").trim();      // prefix on name
+    const klass = (u.searchParams.get("class") || "").trim();    // All / Unknown / exact
+    const timeframe = (u.searchParams.get("timeframe") || "").trim(); // 22nd/23rd/24th/32nd or "all"
+    const perPage = Math.max(1, Math.min(parseInt(u.searchParams.get("starshipsPerPage") || "12", 10), 200));
+    const page = Math.max(0, parseInt(u.searchParams.get("page") || "0", 10));
+    const skip = page * perPage;
 
-      const doc = { name, created_at: new Date(), updated_at: new Date() };
-      if (typeof body.class === "string") doc.class = body.class.trim();
-      if (typeof body.registry === "string") doc.registry = body.registry.trim();
-      if (typeof body.ship_id === "number") doc.ship_id = body.ship_id;
-      if (typeof body.notes === "string") doc.notes = body.notes;
-
-      const r = await col.insertOne(doc);
-      return json(res, 201, { ok: true, id: String(r.insertedId), name: doc.name });
+    // Build filter to match Realm behavior
+    const filter = {};
+    if (name) {
+      filter.name = { $regex: "^" + escRe(name) + ".*", $options: "i" }; // prefix
     }
-
-    if (method === "PUT" || method === "PATCH") {
-      const body = await readJsonBody(req);
-      if (!body.id) return json(res, 400, { ok: false, error: "id is required" });
-      const _id = toObjectId(body.id, "id");
-
-      const $set = { updated_at: new Date() };
-      if (typeof body.name === "string") $set.name = body.name.trim();
-      if (typeof body.class === "string") $set.class = body.class.trim();
-      if (typeof body.registry === "string") $set.registry = body.registry.trim();
-      if (typeof body.ship_id === "number") $set.ship_id = body.ship_id;
-      if (typeof body.notes === "string") $set.notes = body.notes;
-
-      Object.keys($set).forEach(k => $set[k] === undefined && delete $set[k]);
-      if (Object.keys($set).length === 1) return json(res, 400, { ok: false, error: "No updatable fields provided" });
-
-      const r = await col.updateOne({ _id }, { $set });
-      if (r.matchedCount === 0) return json(res, 404, { ok: false, error: "Not Found" });
-
-      const doc = await col.findOne({ _id }, { projection: { _id: 1, name: 1 } });
-      return json(res, 200, { ok: true, id: String(_id), name: doc?.name || null });
+    if (klass) {
+      if (klass === "All") {
+        // no-op
+      } else if (klass === "Unknown") {
+        const unknown = [
+          { class: { $exists: false } },
+          { class: null },
+          { class: "" }
+        ];
+        if (filter.$or) filter.$or.push(...unknown);
+        else filter.$or = unknown;
+      } else {
+        filter.class = { $regex: "^" + escRe(klass) + "$", $options: "i" }; // exact (ci)
+      }
     }
+    Object.assign(filter, timeframeMatch(timeframe));
 
-    if (method === "DELETE") {
-      const u = parseUrl(req);
-      const id = u.searchParams.get("id");
-      if (!id) return json(res, 400, { ok: false, error: "id is required" });
-      const _id = toObjectId(id, "id");
+    const total = await col.countDocuments(filter);
 
-      const r = await col.deleteOne({ _id });
-      if (r.deletedCount === 0) return json(res, 404, { ok: false, error: "Not Found" });
-      return json(res, 200, { ok: true, id: String(_id) });
-    }
+    const docs = await col.aggregate([
+      { $match: filter },
+      { $sort: { ship_id: 1, _id: 1 } },
+      { $skip: skip },
+      { $limit: perPage },
+      {
+        $lookup: {
+          from: "photos",
+          let: { ownerId: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$owner", "$$ownerId"] },
+                    { $eq: ["$subject_id", "$$ownerId"] }
+                  ]
+                }
+              }
+            },
+            { $sort: { created_at: -1, _id: -1 } },
+            { $limit: 1 },
+            { $project: { _id: 0, url: 1 } }
+          ],
+          as: "primaryPhoto"
+        }
+      },
+      {
+        $addFields: {
+          picUrl: {
+            $cond: [
+              { $gt: [{ $size: "$primaryPhoto" }, 0] },
+              [{ $arrayElemAt: ["$primaryPhoto.url", 0] }],
+              []
+            ]
+          }
+        }
+      },
+      { $project: { _id: 1, name: 1, class: 1, registry: 1, ship_id: 1, picUrl: 1 } }
+    ]).toArray();
 
-    res.setHeader("Allow", "GET, POST, PUT, PATCH, DELETE");
-    return json(res, 405, { ok: false, error: "Method Not Allowed" });
+    const starships = docs.map(d => ({
+      ...d,
+      _id: String(d._id) // ensure string
+    }));
+
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    return res.end(JSON.stringify({
+      starships,
+      page,
+      entries_per_page: perPage,
+      total_results: total
+    }));
   } catch (e) {
-    return json(res, 500, { ok: false, error: e.message });
+    res.statusCode = 500;
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    return res.end(JSON.stringify({ ok: false, error: e.message || "Internal error" }));
   }
 };
