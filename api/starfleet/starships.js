@@ -3,6 +3,7 @@ const { getDb } = require("../../src/db");
 const { ObjectId } = require("bson");
 
 function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function isHex24(s) { return typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s); }
 function timeframeMatch(tf) {
   if (!tf || tf.toLowerCase() === "all") return {};
   if (tf === "22nd") return { ship_id: { $lt: 400 } };
@@ -14,8 +15,6 @@ function timeframeMatch(tf) {
 
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
-
-  // Preflight
   if (method === "OPTIONS") { res.statusCode = 204; return res.end(); }
 
   try {
@@ -34,9 +33,15 @@ module.exports = async (req, res) => {
 
     // ---------- DETAIL BRANCH ----------
     if (id) {
-      const _id = new ObjectId(String(id));
+      // Tolerant id match: _id (ObjectId), starship_id (number/string), or string _id
+      const or = [];
+      if (isHex24(id)) or.push({ _id: new ObjectId(id) });
+      const numId = Number(id);
+      if (!Number.isNaN(numId)) or.push({ ship_id: numId }, { starship_id: numId });
+      or.push({ _id: id });
+
       const doc = await col.aggregate([
-        { $match: { _id } },
+        { $match: { $or: or } },
 
         // Primary photo
         {
@@ -44,7 +49,8 @@ module.exports = async (req, res) => {
             from: "photos",
             let: { ownerId: "$_id" },
             pipeline: [
-              { $match: {
+              {
+                $match: {
                   $expr: {
                     $or: [
                       { $eq: ["$owner", "$$ownerId"] },
@@ -61,13 +67,14 @@ module.exports = async (req, res) => {
           }
         },
 
-        // Assignments for this ship (crew), joined with officer info
+        // Crew assignments joined to officers
         {
           $lookup: {
             from: "assignments",
             let: { shipId: "$_id" },
             pipeline: [
-              { $match: {
+              {
+                $match: {
                   $expr: {
                     $or: [
                       { $eq: ["$starship_id", "$$shipId"] },
@@ -81,13 +88,14 @@ module.exports = async (req, res) => {
               {
                 $lookup: {
                   from: "officers",
-                  let: { personId: "$personnel_id" },
+                  let: { personRef: "$personnel_id" },
                   pipeline: [
-                    { $match: {
+                    {
+                      $match: {
                         $expr: {
                           $or: [
-                            { $eq: ["$_id", "$$personId"] },
-                            { $eq: ["$officer_id", "$$personId"] } // alternate FK
+                            { $eq: ["$_id", "$$personRef"] },
+                            { $eq: ["$officer_id", "$$personRef"] }
                           ]
                         }
                       }
@@ -104,7 +112,7 @@ module.exports = async (req, res) => {
           }
         },
 
-        // Current crew = no to_date
+        // Current crew & count
         {
           $addFields: {
             currentCrew: {
@@ -126,18 +134,19 @@ module.exports = async (req, res) => {
           }
         },
 
-        // Recent events for this ship
+        // Recent events
         {
           $lookup: {
             from: "events",
             let: { shipId: "$_id" },
             pipeline: [
-              { $match: {
+              {
+                $match: {
                   $expr: {
                     $or: [
                       { $eq: ["$starship_id", "$$shipId"] },
-                      { $in: ["$$shipId", "$ships"] },
-                      { $in: ["$$shipId", "$subjects"] }
+                      { $in: ["$$shipId", { $ifNull: ["$ships", []] }] },
+                      { $in: ["$$shipId", { $ifNull: ["$subjects", []] }] }
                     ]
                   }
                 }
@@ -150,7 +159,7 @@ module.exports = async (req, res) => {
           }
         },
 
-        // Normalize picUrl; project final
+        // Normalize picUrl & final projection
         {
           $addFields: {
             picUrl: {
@@ -162,7 +171,8 @@ module.exports = async (req, res) => {
             }
           }
         },
-        { $project: { _id: 1, name: 1, class: 1, registry: 1, ship_id: 1, picUrl: 1, crewAssignments: 1, currentCrew: 1, currentCrewCount: 1, recentEvents: 1 } }
+        { $project: { _id: 1, name: 1, class: 1, registry: 1, ship_id: 1, picUrl: 1,
+                      crewAssignments: 1, currentCrew: 1, currentCrewCount: 1, recentEvents: 1 } }
       ]).next();
 
       if (!doc) {
@@ -178,10 +188,10 @@ module.exports = async (req, res) => {
     }
     // ---------- END DETAIL BRANCH ----------
 
-    // ---------- LIST / SEARCH BRANCH (legacy envelope) ----------
-    const name = (u.searchParams.get("name") || "").trim();      // prefix
-    const klass = (u.searchParams.get("class") || "").trim();    // All / Unknown / exact
-    const timeframe = (u.searchParams.get("timeframe") || "").trim(); // 22nd/23rd/24th/32nd or "all"
+    // ---------- LIST / SEARCH (legacy envelope) ----------
+    const name = (u.searchParams.get("name") || "").trim();
+    const klass = (u.searchParams.get("class") || "").trim();
+    const timeframe = (u.searchParams.get("timeframe") || "").trim();
     const perPage = Math.max(1, Math.min(parseInt(u.searchParams.get("starshipsPerPage") || "12", 10), 200));
     const page = Math.max(0, parseInt(u.searchParams.get("page") || "0", 10));
     const skip = page * perPage;
@@ -249,7 +259,6 @@ module.exports = async (req, res) => {
     ]).toArray();
 
     const starships = docs.map(d => ({ ...d, _id: String(d._id) }));
-
     res.statusCode = 200;
     res.setHeader("content-type", "application/json; charset=utf-8");
     return res.end(JSON.stringify({
@@ -262,6 +271,6 @@ module.exports = async (req, res) => {
   } catch (e) {
     res.statusCode = 500;
     res.setHeader("content-type", "application/json; charset=utf-8");
-    return res.end(JSON.stringify({ ok: false, error: e.message || "Internal error" }));
+    return res.end(JSON.stringify({ ok: false, error: e.message || "Internal error", debug: "starships detail/list pipeline" }));
   }
 };

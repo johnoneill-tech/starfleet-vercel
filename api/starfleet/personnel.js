@@ -3,11 +3,10 @@ const { getDb } = require("../../src/db");
 const { ObjectId } = require("bson");
 
 function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function isHex24(s) { return typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s); }
 
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
-
-  // Preflight (CORS headers come from vercel.json)
   if (method === "OPTIONS") { res.statusCode = 204; return res.end(); }
 
   try {
@@ -26,17 +25,26 @@ module.exports = async (req, res) => {
 
     // ---------- DETAIL BRANCH ----------
     if (id) {
-      const _id = new ObjectId(String(id));
-      const doc = await col.aggregate([
-        { $match: { _id } },
+      // Build a tolerant match: try _id (ObjectId), personnel_id (ObjectId), or string _id
+      const or = [];
+      if (isHex24(id)) {
+        const oid = new ObjectId(id);
+        or.push({ _id: oid }, { personnel_id: oid });
+      }
+      // also allow plain-string _id (in case of string ids)
+      or.push({ _id: id });
 
-        // Primary photo
+      const doc = await col.aggregate([
+        { $match: { $or: or } },
+
+        // Primary photo (owner or subject_id)
         {
           $lookup: {
             from: "photos",
             let: { ownerId: "$_id" },
             pipeline: [
-              { $match: {
+              {
+                $match: {
                   $expr: {
                     $or: [
                       { $eq: ["$owner", "$$ownerId"] },
@@ -53,13 +61,14 @@ module.exports = async (req, res) => {
           }
         },
 
-        // Assignments for this officer, with ship info
+        // Assignments joined to starships
         {
           $lookup: {
             from: "assignments",
             let: { personId: "$_id" },
             pipeline: [
-              { $match: {
+              {
+                $match: {
                   $expr: {
                     $or: [
                       { $eq: ["$personnel_id", "$$personId"] },
@@ -73,13 +82,14 @@ module.exports = async (req, res) => {
               {
                 $lookup: {
                   from: "starships",
-                  let: { shipId: "$starship_id" },
+                  let: { shipRef: "$starship_id" },
                   pipeline: [
-                    { $match: {
+                    {
+                      $match: {
                         $expr: {
                           $or: [
-                            { $eq: ["$_id", "$$shipId"] },
-                            { $eq: ["$starship_id", "$$shipId"] } // alternate FK
+                            { $eq: ["$_id", "$$shipRef"] },        // ObjectId FK
+                            { $eq: ["$starship_id", "$$shipRef"] } // numeric/string FK
                           ]
                         }
                       }
@@ -96,7 +106,7 @@ module.exports = async (req, res) => {
           }
         },
 
-        // Current assignment = first one with no to_date (or latest)
+        // Current assignment
         {
           $addFields: {
             currentAssignment: {
@@ -122,18 +132,19 @@ module.exports = async (req, res) => {
           }
         },
 
-        // Recent events this officer is linked to (best-effort; flexible schema)
+        // Recent events
         {
           $lookup: {
             from: "events",
             let: { personId: "$_id" },
             pipeline: [
-              { $match: {
+              {
+                $match: {
                   $expr: {
                     $or: [
-                      { $in: ["$$personId", "$participants"] },
-                      { $in: ["$$personId", "$crew"] },
-                      { $in: ["$$personId", "$personnel_ids"] }
+                      { $in: ["$$personId", { $ifNull: ["$participants", []] }] },
+                      { $in: ["$$personId", { $ifNull: ["$crew", []] }] },
+                      { $in: ["$$personId", { $ifNull: ["$personnel_ids", []] }] }
                     ]
                   }
                 }
@@ -146,7 +157,7 @@ module.exports = async (req, res) => {
           }
         },
 
-        // Normalize picUrl to array; project final shape
+        // Normalize picUrl; final projection
         {
           $addFields: {
             picUrl: {
@@ -161,10 +172,7 @@ module.exports = async (req, res) => {
         {
           $project: {
             _id: 1, name: 1, first: 1, middle: 1, surname: 1, rank: 1, division: 1,
-            picUrl: 1,
-            assignments: 1,
-            currentAssignment: 1,
-            recentEvents: 1
+            picUrl: 1, assignments: 1, currentAssignment: 1, recentEvents: 1
           }
         }
       ]).next();
@@ -175,7 +183,6 @@ module.exports = async (req, res) => {
         return res.end(JSON.stringify({ ok: false, error: "Not Found" }));
       }
 
-      // Stringify _id for client safety
       const out = { ...doc, _id: String(doc._id) };
       res.statusCode = 200;
       res.setHeader("content-type", "application/json; charset=utf-8");
@@ -183,7 +190,7 @@ module.exports = async (req, res) => {
     }
     // ---------- END DETAIL BRANCH ----------
 
-    // ---------- LIST / SEARCH BRANCH (legacy envelope) ----------
+    // ---------- LIST / SEARCH (legacy envelope) ----------
     const name = (u.searchParams.get("name") || "").trim();
     const perPage = Math.max(1, Math.min(parseInt(u.searchParams.get("personnelPerPage") || "10", 10), 200));
     const page = Math.max(0, parseInt(u.searchParams.get("page") || "0", 10));
@@ -191,7 +198,7 @@ module.exports = async (req, res) => {
 
     const filter = {};
     if (name) {
-      const re = new RegExp(escRe(name), "i"); // contains on surname OR first
+      const re = new RegExp(escRe(name), "i");
       filter.$or = [{ surname: re }, { first: re }];
     }
 
@@ -239,7 +246,6 @@ module.exports = async (req, res) => {
     ]).toArray();
 
     const personnel = docs.map(d => ({ ...d, _id: String(d._id) }));
-
     res.statusCode = 200;
     res.setHeader("content-type", "application/json; charset=utf-8");
     return res.end(JSON.stringify({
@@ -252,6 +258,6 @@ module.exports = async (req, res) => {
   } catch (e) {
     res.statusCode = 500;
     res.setHeader("content-type", "application/json; charset=utf-8");
-    return res.end(JSON.stringify({ ok: false, error: e.message || "Internal error" }));
+    return res.end(JSON.stringify({ ok: false, error: e.message || "Internal error", debug: "personnel detail/list pipeline" }));
   }
 };
