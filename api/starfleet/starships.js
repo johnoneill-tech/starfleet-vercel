@@ -3,7 +3,6 @@ const { getDb } = require("../../src/db");
 const { ObjectId } = require("bson");
 
 function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-function isHex24(s) { return typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s); }
 
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
@@ -21,62 +20,86 @@ module.exports = async (req, res) => {
     const u = new URL(req.url || req.originalUrl || "/", "http://local");
     const id = u.searchParams.get("id");
 
-    // ---------- DETAIL (matches Realm) ----------
     if (id) {
-      if (!isHex24(id)) {
-        res.statusCode = 400;
-        res.setHeader("content-type", "application/json; charset=utf-8");
-        return res.end(JSON.stringify({ message: "Invalid id" }));
-      }
+      if (!/^[0-9a-fA-F]{24}$/.test(id)) { res.statusCode = 400; res.setHeader("content-type","application/json; charset=utf-8"); return res.end(JSON.stringify({ message: "Invalid id" })); }
 
       const pipeline = [
         { $match: { _id: new ObjectId(id) } },
 
-        // primary ship photo
+        // photos: primary first, then newest any
         {
           $lookup: {
             from: "photos",
             let: { id: "$_id" },
             pipeline: [
-              { $match: { $and: [{ $expr: { $eq: ["$owner", "$$id"] } }, { primary: true }] } },
-              { $project: { _id: 0, url: 1 } },
+              { $match: { $and: [ { $expr: { $eq: ["$owner", "$$id"] } }, { primary: true } ] } },
+              { $project: { _id: 0, url: 1 } }
             ],
-            as: "shipPics",
-          },
+            as: "primaryPics"
+          }
         },
-        { $addFields: { picUrl: "$shipPics.url" } },
-        { $project: { shipPics: 0 } },
+        {
+          $lookup: {
+            from: "photos",
+            let: { id: "$_id" },
+            pipeline: [
+              { $match: { $expr: { $or: [ { $eq: ["$owner", "$$id"] }, { $eq: ["$subject_id", "$$id"] } ] } } },
+              { $sort: { created_at: -1, _id: -1 } },
+              { $limit: 1 },
+              { $project: { _id: 0, url: 1 } }
+            ],
+            as: "fallbackPics"
+          }
+        },
+        {
+          $addFields: {
+            picUrl: {
+              $cond: [
+                { $gt: [ { $size: "$primaryPics" }, 0 ] },
+                "$primaryPics.url",
+                {
+                  $cond: [
+                    { $gt: [ { $size: "$fallbackPics" }, 0 ] },
+                    "$fallbackPics.url",
+                    []
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        { $project: { primaryPics: 0, fallbackPics: 0 } },
 
-        // personnelCount from Assignment events
+        // personnelCount (same as before)
         {
           $lookup: {
             from: "events",
             let: { id: "$_id" },
             pipeline: [
-              { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Assignment" }] } },
+              { $match: { $and: [ { $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Assignment" } ] } },
               { $group: { _id: "$officerId" } },
-              { $count: "personnelNum" },
+              { $count: "personnelNum" }
             ],
-            as: "personnelAssignments",
-          },
+            as: "personnelAssignments"
+          }
         },
         { $addFields: { personnelCount: "$personnelAssignments.personnelNum" } },
         { $project: { personnelAssignments: 0 } },
 
-        // missionCount from Mission events (without officerId)
+        // missionCount (same as before)
         {
           $lookup: {
             from: "events",
             let: { id: "$_id" },
             pipeline: [
-              { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Mission" }, { officerId: { $exists: false } }] } },
-              { $count: "missonNum" },
+              { $match: { $and: [ { $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Mission" }, { officerId: { $exists: false } } ] } },
+              { $count: "missonNum" }
             ],
-            as: "missions",
-          },
+            as: "missions"
+          }
         },
         { $addFields: { missionCount: "$missions.missonNum" } },
-        { $project: { missions: 0 } },
+        { $project: { missions: 0 } }
       ];
 
       let doc = await col.aggregate(pipeline).next();
@@ -86,124 +109,105 @@ module.exports = async (req, res) => {
       ["launch_date","commission_date","decommission_date","destruction_date"].forEach(k => { if (doc[k]) doc[k] = new Date(doc[k]).toISOString(); });
       if (doc.personnelCount) doc.personnelCount = doc.personnelCount.toString();
       if (doc.missionCount) doc.missionCount = doc.missionCount.toString();
-      if (doc.ship_id) doc.ship_id = String(doc.ship_id);
+      if (doc.ship_id != null) doc.ship_id = String(doc.ship_id);
 
       res.statusCode = 200;
-      res.setHeader("content-type", "application/json; charset=utf-8");
+      res.setHeader("content-type","application/json; charset=utf-8");
       return res.end(JSON.stringify(doc));
     }
 
-    // ---------- LIST (matches Realm) ----------
+    // LIST (unchanged parity with envelope)
     let starshipsPerPage = parseInt(u.searchParams.get("starshipsPerPage") || "12", 10);
     const page = parseInt(u.searchParams.get("page") || "0", 10);
-    const name = (u.searchParams.get("name") || "").trim();           // prefix
-    const klass = (u.searchParams.get("class") || "").trim();         // All | Unknown | exact
-    const timeframe = (u.searchParams.get("timeframe") || "").trim(); // 22nd/23rd/24th/32nd
+    const name = (u.searchParams.get("name") || "").trim();
+    const klass = (u.searchParams.get("class") || "").trim();
+    const timeframe = (u.searchParams.get("timeframe") || "").trim();
 
-    // name prefix
     let nameQuery = {};
     if (name) nameQuery = { name: { $regex: "^" + escRe(name) + ".*", $options: "i" } };
 
-    // class filter
     let classQuery = {};
     if (klass && klass !== "All") {
       if (klass === "Unknown") {
-        classQuery = {
-          $or: [
-            { class: { $exists: false } },
-            { class: null },
-            { class: "" }
-          ]
-        };
+        classQuery = { $or: [ { class: { $exists: false } }, { class: null }, { class: "" } ] };
       } else {
         classQuery = { class: { $regex: "^" + escRe(klass) + "$", $options: "i" } };
       }
     }
 
-    // timeframe -> ship_id ranges (your Realm ranges)
     let startTimeFrame = 0, endTimeFrame = 999999;
     if (timeframe === "22nd") { startTimeFrame = 0; endTimeFrame = 400; }
     if (timeframe === "23rd") { startTimeFrame = 400; endTimeFrame = 2500; }
     if (timeframe === "24th") { startTimeFrame = 2500; endTimeFrame = 110000; }
     if (timeframe === "32nd") { startTimeFrame = 110000; endTimeFrame = 999999; }
-    const timeQuery = { $and: [{ ship_id: { $gte: startTimeFrame } }, { ship_id: { $lt: endTimeFrame } }] };
+    const timeQuery = { $and: [ { ship_id: { $gte: startTimeFrame } }, { ship_id: { $lt: endTimeFrame } } ] };
 
-    const query = { $and: [nameQuery, classQuery, timeQuery] };
+    const query = { $and: [ nameQuery, classQuery, timeQuery ] };
 
-    const pipeline = [
+    const list = await col.aggregate([
       { $match: query },
-
-      // primary ship photo
       {
         $lookup: {
           from: "photos",
           let: { id: "$_id" },
           pipeline: [
-            { $match: { $and: [{ $expr: { $eq: ["$owner", "$$id"] } }, { primary: true }] } },
-            { $project: { _id: 0, title: 0, description: 0, owner: 0, url: 1 } },
+            { $match: { $and: [ { $expr: { $eq: ["$owner", "$$id"] } }, { primary: true } ] } },
+            { $project: { _id: 0, title: 0, description: 0, owner: 0, url: 1 } }
           ],
-          as: "shipPics",
-        },
+          as: "shipPics"
+        }
       },
       { $addFields: { picUrl: "$shipPics.url" } },
       { $project: { shipPics: 0 } },
-
-      // personnelCount
       {
-        $lookup: {
+        $lookup: { // quick count joins, same as detail
           from: "events",
           let: { id: "$_id" },
           pipeline: [
-            { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Assignment" }] } },
+            { $match: { $and: [ { $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Assignment" } ] } },
             { $group: { _id: "$officerId" } },
-            { $count: "personnelNum" },
+            { $count: "personnelNum" }
           ],
-          as: "personnelAssignments",
-        },
+          as: "personnelAssignments"
+        }
       },
       { $addFields: { personnelCount: "$personnelAssignments.personnelNum" } },
       { $project: { personnelAssignments: 0 } },
-
-      // missionCount
       {
         $lookup: {
           from: "events",
           let: { id: "$_id" },
           pipeline: [
-            { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Mission" }, { officerId: { $exists: false } }] } },
-            { $count: "missonNum" },
+            { $match: { $and: [ { $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Mission" }, { officerId: { $exists: false } } ] } },
+            { $count: "missonNum" }
           ],
-          as: "missions",
-        },
+          as: "missions"
+        }
       },
       { $addFields: { missionCount: "$missions.missonNum" } },
       { $project: { missions: 0 } },
-
       { $sort: { ship_id: 1 } },
       { $skip: page * starshipsPerPage },
-      { $limit: starshipsPerPage },
-    ];
+      { $limit: starshipsPerPage }
+    ]).toArray();
 
-    const list = await col.aggregate(pipeline).toArray();
     list.forEach(s => {
       s._id = String(s._id);
       if (s.ship_id != null) s.ship_id = String(s.ship_id);
-      ["launch_date","commission_date","decommission_date","destruction_date"].forEach(k => { if (s[k]) s[k] = new Date(s[k]).toISOString(); });
     });
 
     const total = await col.countDocuments(query);
     res.statusCode = 200;
-    res.setHeader("content-type", "application/json; charset=utf-8");
+    res.setHeader("content-type","application/json; charset=utf-8");
     return res.end(JSON.stringify({
       starships: list,
       page: String(page),
       entries_per_page: String(starshipsPerPage),
-      total_results: String(total),
-      search_queries: query,
+      total_results: String(total)
     }));
   } catch (e) {
     res.statusCode = 500;
-    res.setHeader("content-type", "application/json; charset=utf-8");
+    res.setHeader("content-type","application/json; charset=utf-8");
     return res.end(JSON.stringify({ message: e.message || "Internal error" }));
   }
 };
