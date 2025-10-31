@@ -8,256 +8,226 @@ function isHex24(s) { return typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
   if (method === "OPTIONS") { res.statusCode = 204; return res.end(); }
+  if (method !== "GET") {
+    res.statusCode = 405;
+    res.setHeader("Allow", "GET, OPTIONS");
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    return res.end(JSON.stringify({ message: "Method Not Allowed" }));
+  }
 
   try {
     const db = await getDb();
     const col = db.collection("officers");
 
-    if (method !== "GET") {
-      res.statusCode = 405;
-      res.setHeader("Allow", "GET, OPTIONS");
-      res.setHeader("content-type", "application/json; charset=utf-8");
-      return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
-    }
-
     const u = new URL(req.url || req.originalUrl || "/", "http://local");
     const id = u.searchParams.get("id");
 
-    // ---------- DETAIL BRANCH ----------
+    // ---------- DETAIL (matches Realm) ----------
     if (id) {
-      // Build a tolerant match: try _id (ObjectId), personnel_id (ObjectId), or string _id
-      const or = [];
-      if (isHex24(id)) {
-        const oid = new ObjectId(id);
-        or.push({ _id: oid }, { personnel_id: oid });
+      if (!isHex24(id)) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Invalid id" }));
       }
-      // also allow plain-string _id (in case of string ids)
-      or.push({ _id: id });
 
-      const doc = await col.aggregate([
-        { $match: { $or: or } },
+      const pipeline = [
+        { $match: { _id: new ObjectId(id) } },
 
-        // Primary photo (owner or subject_id)
-        {
-          $lookup: {
-            from: "photos",
-            let: { ownerId: "$_id" },
-            pipeline: [
-              {
-                $match: {
-                  $expr: {
-                    $or: [
-                      { $eq: ["$owner", "$$ownerId"] },
-                      { $eq: ["$subject_id", "$$ownerId"] }
-                    ]
-                  }
-                }
-              },
-              { $sort: { created_at: -1, _id: -1 } },
-              { $limit: 1 },
-              { $project: { _id: 0, url: 1 } }
-            ],
-            as: "primaryPhoto"
-          }
-        },
-
-        // Assignments joined to starships
-        {
-          $lookup: {
-            from: "assignments",
-            let: { personId: "$_id" },
-            pipeline: [
-              {
-                $match: {
-                  $expr: {
-                    $or: [
-                      { $eq: ["$personnel_id", "$$personId"] },
-                      { $eq: ["$officer_id", "$$personId"] }
-                    ]
-                  }
-                }
-              },
-              { $sort: { from_date: -1, _id: -1 } },
-              { $limit: 50 },
-              {
-                $lookup: {
-                  from: "starships",
-                  let: { shipRef: "$starship_id" },
-                  pipeline: [
-                    {
-                      $match: {
-                        $expr: {
-                          $or: [
-                            { $eq: ["$_id", "$$shipRef"] },        // ObjectId FK
-                            { $eq: ["$starship_id", "$$shipRef"] } // numeric/string FK
-                          ]
-                        }
-                      }
-                    },
-                    { $project: { _id: 1, name: 1, registry: 1, class: 1, ship_id: 1 } }
-                  ],
-                  as: "ship"
-                }
-              },
-              { $addFields: { ship: { $ifNull: [ { $arrayElemAt: ["$ship", 0] }, null ] } } },
-              { $project: { _id: 1, role: 1, from_date: 1, to_date: 1, ship: 1 } }
-            ],
-            as: "assignments"
-          }
-        },
-
-        // Current assignment
-        {
-          $addFields: {
-            currentAssignment: {
-              $let: {
-                vars: {
-                  open: {
-                    $filter: {
-                      input: "$assignments",
-                      as: "a",
-                      cond: { $or: [ { $eq: ["$$a.to_date", null] }, { $not: ["$$a.to_date"] } ] }
-                    }
-                  }
-                },
-                in: {
-                  $cond: [
-                    { $gt: [ { $size: "$$open" }, 0 ] },
-                    { $arrayElemAt: ["$$open", 0] },
-                    { $arrayElemAt: ["$assignments", 0] }
-                  ]
-                }
-              }
-            }
-          }
-        },
-
-        // Recent events
+        // lastAssignment (Assignment/Promotion/Demotion, not Retired) + join starship name/registry
         {
           $lookup: {
             from: "events",
-            let: { personId: "$_id" },
+            let: { id: "$_id" },
             pipeline: [
               {
                 $match: {
-                  $expr: {
-                    $or: [
-                      { $in: ["$$personId", { $ifNull: ["$participants", []] }] },
-                      { $in: ["$$personId", { $ifNull: ["$crew", []] }] },
-                      { $in: ["$$personId", { $ifNull: ["$personnel_ids", []] }] }
-                    ]
-                  }
-                }
+                  $and: [
+                    { $expr: { $eq: ["$officerId", "$$id"] } },
+                    { $or: [{ type: "Assignment" }, { type: "Promotion" }, { type: "Demotion" }] },
+                    { position: { $ne: "Retired" } },
+                  ],
+                },
               },
-              { $sort: { date: -1, _id: -1 } },
-              { $limit: 10 },
-              { $project: { _id: 1, name: 1, title: 1, date: 1, type: 1 } }
+              { $sort: { date: -1 } },
+              { $limit: 1 },
+              {
+                $lookup: {
+                  from: "starships",
+                  let: { id: "$starshipId" },
+                  pipeline: [
+                    { $match: { $expr: { $eq: ["$_id", "$$id"] } } },
+                    { $project: { _id: 0, name: 1, registry: 1 } },
+                  ],
+                  as: "starshipInfo",
+                },
+              },
+              { $replaceRoot: { newRoot: { $mergeObjects: [{ $arrayElemAt: ["$starshipInfo", 0] }, "$$ROOT"] } } },
+              { $project: { starshipInfo: 0 } },
             ],
-            as: "recentEvents"
-          }
+            as: "lastAssignment",
+          },
         },
+        { $replaceRoot: { newRoot: { $mergeObjects: [{ $arrayElemAt: ["$lastAssignment", 0] }, "$$ROOT"] } } },
+        { $project: { lastAssignment: 0 } },
 
-        // Normalize picUrl; final projection
+        // starshipCount (assignments with starshipId)
         {
-          $addFields: {
-            picUrl: {
-              $cond: [
-                { $gt: [ { $size: "$primaryPhoto" }, 0 ] },
-                [ { $arrayElemAt: ["$primaryPhoto.url", 0] } ],
-                []
-              ]
-            }
-          }
+          $lookup: {
+            from: "events",
+            let: { id: "$_id" },
+            pipeline: [
+              {
+                $match: {
+                  $and: [
+                    { $expr: { $eq: ["$officerId", "$$id"] } },
+                    { type: "Assignment" },
+                    { starshipId: { $exists: true } },
+                  ],
+                },
+              },
+              { $group: { _id: "$starshipId" } },
+              { $count: "vesslesNum" },
+            ],
+            as: "starshipAssignments",
+          },
         },
+        { $addFields: { starshipCount: "$starshipAssignments.vesslesNum" } },
+        { $project: { starshipAssignments: 0 } },
+
+        // assignCount (Assignment / Promotion / Demotion)
         {
-          $project: {
-            _id: 1, name: 1, first: 1, middle: 1, surname: 1, rank: 1, division: 1,
-            picUrl: 1, assignments: 1, currentAssignment: 1, recentEvents: 1
-          }
-        }
-      ]).next();
+          $lookup: {
+            from: "events",
+            let: { id: "$_id" },
+            pipeline: [
+              {
+                $match: {
+                  $and: [
+                    { $expr: { $eq: ["$officerId", "$$id"] } },
+                    { $or: [{ type: "Assignment" }, { type: "Promotion" }, { type: "Demotion" }] },
+                  ],
+                },
+              },
+              { $count: "AssignProDeNum" },
+            ],
+            as: "Assign-Pro-De",
+          },
+        },
+        { $addFields: { assignCount: "$Assign-Pro-De.AssignProDeNum" } },
+        { $project: { "Assign-Pro-De": 0 } },
 
-      if (!doc) {
-        res.statusCode = 404;
-        res.setHeader("content-type", "application/json; charset=utf-8");
-        return res.end(JSON.stringify({ ok: false, error: "Not Found" }));
-      }
+        // missionCount (Mission events with no officerId)
+        {
+          $lookup: {
+            from: "events",
+            let: { id: "$_id" },
+            pipeline: [
+              {
+                $match: {
+                  $and: [
+                    { $expr: { $eq: ["$officerId", "$$id"] } },
+                    { type: "Mission" },
+                    { officerId: { $exists: false } },
+                  ],
+                },
+              },
+              { $count: "generalNum" },
+            ],
+            as: "generalMissions",
+          },
+        },
+        { $addFields: { missionCount: "$generalMissions.generalNum" } },
+        { $project: { generalMissions: 0 } },
 
-      const out = { ...doc, _id: String(doc._id) };
+        // lifeEventCount
+        {
+          $lookup: {
+            from: "events",
+            let: { id: "$_id" },
+            pipeline: [
+              { $match: { $and: [{ $expr: { $eq: ["$officerId", "$$id"] } }, { type: "Life Event" }] } },
+              { $count: "lifeEventsNum" },
+            ],
+            as: "lifeEvents",
+          },
+        },
+        { $addFields: { lifeEventCount: "$lifeEvents.lifeEventsNum" } },
+        { $project: { lifeEvents: 0 } },
+
+        // primary photo
+        {
+          $lookup: {
+            from: "photos",
+            let: { id: "$_id" },
+            pipeline: [
+              { $match: { $and: [{ $expr: { $eq: ["$owner", "$$id"] } }, { primary: true }] } },
+              { $project: { _id: 0, url: 1 } },
+            ],
+            as: "officerPics",
+          },
+        },
+        { $addFields: { picUrl: "$officerPics.url" } },
+        { $project: { officerPics: 0 } },
+      ];
+
+      let doc = await col.aggregate(pipeline).next();
+      if (!doc) { res.statusCode = 404; res.setHeader("content-type","application/json; charset=utf-8"); return res.end(JSON.stringify({ message: "Not Found" })); }
+
+      // ISO date normalization (matches your function)
+      ["birthDate", "deathDate", "date", "endDate"].forEach(k => { if (doc[k]) doc[k] = new Date(doc[k]).toISOString(); });
+      ["starshipCount", "missionCount", "assignCount", "lifeEventCount"].forEach(k => { if (doc[k]) doc[k] = doc[k].toString(); });
+      doc._id = String(doc._id);
+
       res.statusCode = 200;
       res.setHeader("content-type", "application/json; charset=utf-8");
-      return res.end(JSON.stringify({ ok: true, ...out }));
+      return res.end(JSON.stringify(doc));
     }
-    // ---------- END DETAIL BRANCH ----------
 
-    // ---------- LIST / SEARCH (legacy envelope) ----------
+    // ---------- LIST (matches Realm) ----------
+    const personnelPerPage = parseInt(u.searchParams.get("personnelPerPage") || "10", 10);
+    const page = parseInt(u.searchParams.get("page") || "0", 10);
     const name = (u.searchParams.get("name") || "").trim();
-    const perPage = Math.max(1, Math.min(parseInt(u.searchParams.get("personnelPerPage") || "10", 10), 200));
-    const page = Math.max(0, parseInt(u.searchParams.get("page") || "0", 10));
-    const skip = page * perPage;
 
-    const filter = {};
-    if (name) {
-      const re = new RegExp(escRe(name), "i");
-      filter.$or = [{ surname: re }, { first: re }];
-    }
+    const query = name ? { $or: [{ surname: { $regex: escRe(name), $options: "i" } }, { first: { $regex: escRe(name), $options: "i" } }] } : {};
 
-    const total = await col.countDocuments(filter);
-
-    const docs = await col.aggregate([
-      { $match: filter },
-      { $sort: { surname: 1, first: 1, middle: 1, _id: 1 } },
-      { $skip: skip },
-      { $limit: perPage },
+    const pipeline = [
+      { $match: query },
       {
         $lookup: {
           from: "photos",
-          let: { ownerId: "$_id" },
+          let: { id: "$_id" },
           pipeline: [
-            {
-              $match: {
-                $expr: {
-                  $or: [
-                    { $eq: ["$owner", "$$ownerId"] },
-                    { $eq: ["$subject_id", "$$ownerId"] }
-                  ]
-                }
-              }
-            },
-            { $sort: { created_at: -1, _id: -1 } },
-            { $limit: 1 },
-            { $project: { _id: 0, url: 1 } }
+            { $match: { $and: [{ $expr: { $eq: ["$owner", "$$id"] } }, { primary: true }] } },
+            { $project: { _id: 0, title: 0, description: 0, owner: 0, url: 1 } },
           ],
-          as: "primaryPhoto"
-        }
+          as: "officerPics",
+        },
       },
-      {
-        $addFields: {
-          picUrl: {
-            $cond: [
-              { $gt: [{ $size: "$primaryPhoto" }, 0] },
-              [{ $arrayElemAt: ["$primaryPhoto.url", 0] }],
-              []
-            ]
-          }
-        }
-      },
-      { $project: { _id: 1, name: 1, first: 1, middle: 1, surname: 1, rank: 1, division: 1, picUrl: 1 } }
-    ]).toArray();
+      { $sort: { surname: 1, first: 1, middle: 1 } },
+      { $addFields: { picUrl: "$officerPics.url" } },
+      { $project: { officerPics: 0 } },
+      { $skip: page * personnelPerPage },
+      { $limit: personnelPerPage },
+    ];
 
-    const personnel = docs.map(d => ({ ...d, _id: String(d._id) }));
+    const list = await col.aggregate(pipeline).toArray();
+    list.forEach(o => {
+      o._id = String(o._id);
+      ["birthDate","deathDate"].forEach(k => { if (o[k]) o[k] = new Date(o[k]).toISOString(); });
+    });
+
+    const total = await col.countDocuments(query);
     res.statusCode = 200;
     res.setHeader("content-type", "application/json; charset=utf-8");
     return res.end(JSON.stringify({
-      personnel,
-      page,
-      entries_per_page: perPage,
-      total_results: total
+      personnel: list,
+      page: String(page),
+      entries_per_page: String(personnelPerPage),
+      total_results: String(total),
     }));
-    // ---------- END LIST BRANCH ----------
   } catch (e) {
     res.statusCode = 500;
     res.setHeader("content-type", "application/json; charset=utf-8");
-    return res.end(JSON.stringify({ ok: false, error: e.message || "Internal error", debug: "personnel detail/list pipeline" }));
+    return res.end(JSON.stringify({ message: e.message || "Internal error" }));
   }
 };
