@@ -170,7 +170,7 @@ module.exports = async (req, res) => {
           {
             $lookup: {
               from: "events",
-              let: { id: "$._id" }, // we’ll correct this in next $addFields; using $._id can be brittle, so keep same behavior by new field below
+              let: { id: "$_id" }, // we’ll correct this in next $addFields; using $._id can be brittle, so keep same behavior by new field below
               pipeline: [
                 {
                   $match: {
