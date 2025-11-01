@@ -6,16 +6,12 @@ const { ObjectId } = require("bson");
 function isHex24(s) {
   return typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s);
 }
-function asOid(v) {
-  try { return new ObjectId(v); } catch { return null; }
-}
 function sortDir(v) {
-  // "1" = asc, anything else = desc (preserve your existing contract)
+  // "1" = asc; anything else = desc (preserve prior contract)
   return String(v) === "1" ? 1 : -1;
 }
 
-// Optional category bundle map to mirror legacy keys
-// "Assign-Pro-De" groups Assignment/Promotion/Demotion exactly like your old pipeline.
+// Optional bundle mapping to mirror legacy keys
 const CATEGORY_BUNDLES = {
   "Assign-Pro-De": ["Assignment", "Promotion", "Demotion"],
 };
@@ -23,13 +19,12 @@ const CATEGORY_BUNDLES = {
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
 
-  // Preflight
+  // CORS preflight (headers are also set in vercel.json; this is safe)
   if (method === "OPTIONS") {
     res.statusCode = 204;
     return res.end();
   }
 
-  // Only GET supported (per your current handler)
   if (method !== "GET") {
     res.statusCode = 405;
     res.setHeader("Allow", "GET, OPTIONS");
@@ -50,44 +45,43 @@ module.exports = async (req, res) => {
     // Existing explicit params
     const officer_id  = u.searchParams.get("officer_id");
     const starship_id = u.searchParams.get("starship_id");
-    // NEW: polymorphic param (legacy frontend uses this)
+    // NEW: polymorphic param supported for legacy frontend usage
     const subject_id  = u.searchParams.get("subject_id");
 
     // Build match
     const match = {};
     const or = [];
 
-    // Officer filter (accept ObjectId or string — your docs permit both)
+    // Officer filter: accept ObjectId or raw string id
     if (officer_id) {
       if (isHex24(officer_id)) or.push({ officerId: new ObjectId(officer_id) });
       or.push({ officerId: officer_id });
     }
 
-    // Starship filter
+    // Starship filter: accept ObjectId or raw string id
     if (starship_id) {
       if (isHex24(starship_id)) or.push({ starshipId: new ObjectId(starship_id) });
       or.push({ starshipId: starship_id });
     }
 
-    // SUBJECT_ID support (either officer or ship). This is what your old UI passes.
+    // SUBJECT_ID (polymorphic: could be an officer or a ship)
     if (subject_id) {
       if (isHex24(subject_id)) {
         const oid = new ObjectId(subject_id);
         or.push({ officerId: oid }, { starshipId: oid });
       }
-      // also match as raw string for safety
       or.push({ officerId: subject_id }, { starshipId: subject_id });
     }
 
     if (or.length) match.$or = or;
 
-    // Category handling (single, CSV, or bundle like "Assign-Pro-De")
+    // Category handling: bundle key, CSV, or single
     if (categoryParam) {
       let cats = [];
       if (CATEGORY_BUNDLES[categoryParam]) {
         cats = CATEGORY_BUNDLES[categoryParam];
       } else if (categoryParam.includes(",")) {
-        cats = categoryParam.split(",").map(s => s.trim()).filter(Boolean);
+        cats = categoryParam.split(",").map((s) => s.trim()).filter(Boolean);
       } else {
         cats = [categoryParam];
       }
@@ -98,18 +92,18 @@ module.exports = async (req, res) => {
     const pipeline = [
       { $match: match },
 
-      // Optional join: starship meta (name, registry, class, picUrl)
+      // Join starship metadata for UI (name, registry, class, picUrl)
       {
         $lookup: {
           from: "starships",
           localField: "starshipId",
           foreignField: "_id",
           as: "ship",
-        }
+        },
       },
       { $addFields: { ship: { $arrayElemAt: ["$ship", 0] } } },
 
-      // Normalize a couple of fields for the UI (tolerant projection)
+      // Normalize fields expected by your VesselsServed UI
       {
         $project: {
           _id: 1,
@@ -123,50 +117,26 @@ module.exports = async (req, res) => {
           tags: 1,
           source: 1,
 
-          // Starship display fields expected by the UI component
+          // Starship display fields
           name: { $ifNull: ["$ship.name", null] },
           registry: { $ifNull: ["$ship.registry", null] },
           class: { $ifNull: ["$ship.class", null] },
-          starshipPicUrl: { $ifNull: ["$ship.picUrl", []] }, // detail routes already make picUrl: string[]
-        }
+          starshipPicUrl: { $ifNull: ["$ship.picUrl", []] }, // detail endpoints already set picUrl: string[]
+        },
       },
 
-      // Sort by date, then _id for stability
+      // Sort & paginate
       { $sort: { date: sort, _id: sort } },
-
-      // Pagination facet
-      {
-        $facet: {
-          items: [
-            { $skip: page * perPage },
-            { $limit: perPage },
-          ],
-          total: [{ $count: "n" }],
-        }
-      }
+      { $skip: page * perPage },
+      { $limit: perPage },
     ];
 
-    const [agg] = await col.aggregate(pipeline, { allowDiskUse: true }).toArray();
-    const items = agg?.items || [];
-    const total = agg?.total?.[0]?.n || 0;
+    const items = await col.aggregate(pipeline, { allowDiskUse: true }).toArray();
 
+    // IMPORTANT: return a *bare array* so response.data is an array on the frontend
     res.statusCode = 200;
     res.setHeader("content-type", "application/json; charset=utf-8");
-
-    // IMPORTANT:
-    // If the caller used `subject_id` (legacy polymorphic param),
-    // return a *bare array* to preserve the old frontend contract:
-    if (subject_id) {
-      return res.end(JSON.stringify(items));
-    }
-
-    // Otherwise keep the wrapper you had: { ok, count, events, items }
-    return res.end(JSON.stringify({
-      ok: true,
-      count: String(items.length),
-      events: items,
-      items
-    }));
+    return res.end(JSON.stringify(items));
   } catch (e) {
     res.statusCode = 500;
     res.setHeader("content-type", "application/json; charset=utf-8");
