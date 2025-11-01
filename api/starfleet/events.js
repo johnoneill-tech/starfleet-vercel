@@ -2,12 +2,34 @@
 const { getDb } = require("../../src/db");
 const { ObjectId } = require("bson");
 
-function isHex24(s) { return typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s); }
-function sortDir(v) { return String(v) === "1" ? 1 : -1; }
+// Helpers
+function isHex24(s) {
+  return typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s);
+}
+function asOid(v) {
+  try { return new ObjectId(v); } catch { return null; }
+}
+function sortDir(v) {
+  // "1" = asc, anything else = desc (preserve your existing contract)
+  return String(v) === "1" ? 1 : -1;
+}
+
+// Optional category bundle map to mirror legacy keys
+// "Assign-Pro-De" groups Assignment/Promotion/Demotion exactly like your old pipeline.
+const CATEGORY_BUNDLES = {
+  "Assign-Pro-De": ["Assignment", "Promotion", "Demotion"],
+};
 
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
-  if (method === "OPTIONS") { res.statusCode = 204; return res.end(); }
+
+  // Preflight
+  if (method === "OPTIONS") {
+    res.statusCode = 204;
+    return res.end();
+  }
+
+  // Only GET supported (per your current handler)
   if (method !== "GET") {
     res.statusCode = 405;
     res.setHeader("Allow", "GET, OPTIONS");
@@ -19,73 +41,126 @@ module.exports = async (req, res) => {
     const db = await getDb();
     const col = db.collection("events");
 
-    const u = new URL(req.url || req.originalUrl || "/", "http://local");
-    const category = (u.searchParams.get("category") || "").trim();
-    const officer_id = u.searchParams.get("officer_id");
-    const starship_id = u.searchParams.get("starship_id");
+    const u = new URL(req.url, "http://local");
+    const categoryParam = (u.searchParams.get("category") || "").trim();
     const sort = sortDir(u.searchParams.get("sort"));
+    const page = Number(u.searchParams.get("page") || 0);
+    const perPage = Math.min(Number(u.searchParams.get("perPage") || 100), 500);
 
-    // base filter
+    // Existing explicit params
+    const officer_id  = u.searchParams.get("officer_id");
+    const starship_id = u.searchParams.get("starship_id");
+    // NEW: polymorphic param (legacy frontend uses this)
+    const subject_id  = u.searchParams.get("subject_id");
+
+    // Build match
     const match = {};
-    if (category === "Assign-Pro-De") {
-      match.type = { $in: ["Assignment", "Promotion", "Demotion"] };
-    } else if (category === "Assignment") {
-      match.type = "Assignment";
-    } else if (category === "Mission") {
-      match.type = "Mission";
-    } else if (category === "Life Event") {
-      match.type = "Life Event";
-    }
+    const or = [];
 
+    // Officer filter (accept ObjectId or string — your docs permit both)
     if (officer_id) {
-      if (isHex24(officer_id)) match.officerId = new ObjectId(officer_id);
-      else match.officerId = officer_id; // defensive fallback
-    }
-    if (starship_id) {
-      if (isHex24(starship_id)) match.starshipId = new ObjectId(starship_id);
-      else {
-        const asNum = Number(starship_id);
-        match.$or = [
-          { starshipId: starship_id },
-          { starship_id: asNum },
-          { ship_id: asNum }
-        ];
-      }
+      if (isHex24(officer_id)) or.push({ officerId: new ObjectId(officer_id) });
+      or.push({ officerId: officer_id });
     }
 
-    // Join starship name/registry when a ship is referenced
+    // Starship filter
+    if (starship_id) {
+      if (isHex24(starship_id)) or.push({ starshipId: new ObjectId(starship_id) });
+      or.push({ starshipId: starship_id });
+    }
+
+    // SUBJECT_ID support (either officer or ship). This is what your old UI passes.
+    if (subject_id) {
+      if (isHex24(subject_id)) {
+        const oid = new ObjectId(subject_id);
+        or.push({ officerId: oid }, { starshipId: oid });
+      }
+      // also match as raw string for safety
+      or.push({ officerId: subject_id }, { starshipId: subject_id });
+    }
+
+    if (or.length) match.$or = or;
+
+    // Category handling (single, CSV, or bundle like "Assign-Pro-De")
+    if (categoryParam) {
+      let cats = [];
+      if (CATEGORY_BUNDLES[categoryParam]) {
+        cats = CATEGORY_BUNDLES[categoryParam];
+      } else if (categoryParam.includes(",")) {
+        cats = categoryParam.split(",").map(s => s.trim()).filter(Boolean);
+      } else {
+        cats = [categoryParam];
+      }
+      if (cats.length) match.category = { $in: cats };
+    }
+
+    // Pipeline
     const pipeline = [
       { $match: match },
-      { $sort: { date: sort, _id: sort } },
+
+      // Optional join: starship meta (name, registry, class, picUrl)
       {
         $lookup: {
           from: "starships",
-          let: { sid: "$starshipId" },
-          pipeline: [
-            { $match: { $expr: { $eq: ["$_id", "$$sid"] } } },
-            { $project: { _id: 1, name: 1, registry: 1, class: 1, ship_id: 1 } }
-          ],
-          as: "ship"
+          localField: "starshipId",
+          foreignField: "_id",
+          as: "ship",
         }
       },
-      { $addFields: { ship: { $ifNull: [ { $arrayElemAt: ["$ship", 0] }, null ] } } },
-      // You can join officer here if you need it in other views
+      { $addFields: { ship: { $arrayElemAt: ["$ship", 0] } } },
+
+      // Normalize a couple of fields for the UI (tolerant projection)
       {
         $project: {
-          _id: 1, type: 1, position: 1, date: 1, title: 1, name: 1,
-          officerId: 1, starshipId: 1, ship: 1
+          _id: 1,
+          officerId: 1,
+          starshipId: 1,
+          category: 1,
+          date: 1,
+          title: 1,
+          subtitle: 1,
+          details: 1,
+          tags: 1,
+          source: 1,
+
+          // Starship display fields expected by the UI component
+          name: { $ifNull: ["$ship.name", null] },
+          registry: { $ifNull: ["$ship.registry", null] },
+          class: { $ifNull: ["$ship.class", null] },
+          starshipPicUrl: { $ifNull: ["$ship.picUrl", []] }, // detail routes already make picUrl: string[]
+        }
+      },
+
+      // Sort by date, then _id for stability
+      { $sort: { date: sort, _id: sort } },
+
+      // Pagination facet
+      {
+        $facet: {
+          items: [
+            { $skip: page * perPage },
+            { $limit: perPage },
+          ],
+          total: [{ $count: "n" }],
         }
       }
     ];
 
-    const items = await col.aggregate(pipeline).toArray();
-
-    // ISO-ify dates
-    items.forEach(e => { if (e.date) e.date = new Date(e.date).toISOString(); });
+    const [agg] = await col.aggregate(pipeline, { allowDiskUse: true }).toArray();
+    const items = agg?.items || [];
+    const total = agg?.total?.[0]?.n || 0;
 
     res.statusCode = 200;
     res.setHeader("content-type", "application/json; charset=utf-8");
-    // Return in a flexible shape (array + keyed field)
+
+    // IMPORTANT:
+    // If the caller used `subject_id` (legacy polymorphic param),
+    // return a *bare array* to preserve the old frontend contract:
+    if (subject_id) {
+      return res.end(JSON.stringify(items));
+    }
+
+    // Otherwise keep the wrapper you had: { ok, count, events, items }
     return res.end(JSON.stringify({
       ok: true,
       count: String(items.length),
