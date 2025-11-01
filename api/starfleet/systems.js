@@ -9,7 +9,7 @@ function isHex24(s) {
 function toObjectId(v) {
   if (!v) return v;
   if (isHex24(v)) return new ObjectId(v);
-  return v; // allow legacy string ids if your data had any
+  return v; // allow legacy string ids if any existed
 }
 function toIsoOrNull(d) {
   try {
@@ -85,7 +85,6 @@ module.exports = async (req, res) => {
 
           const resultsList = await systemsCol.aggregate(pipeline, { allowDiskUse: true }).toArray();
 
-          // legacy: stringify ids and certain numerics
           for (const r of resultsList) {
             if (r._id) r._id = String(r._id);
             if (r.numOfPlanets != null) r.numOfPlanets = String(r.numOfPlanets);
@@ -108,6 +107,21 @@ module.exports = async (req, res) => {
         // ---- Detail by id ----
         const pipeline = [
           { $match: { _id: toObjectId(id) } },
+
+          // Primary photo for the system (to match list shape)
+          {
+            $lookup: {
+              from: "photos",
+              let: { id: "$_id" },
+              pipeline: [
+                { $match: { $and: [{ $expr: { $eq: ["$owner", "$$id"] } }, { primary: true }] } },
+                { $project: { _id: 0, url: 1 } },
+              ],
+              as: "pics",
+            },
+          },
+          { $addFields: { picUrl: "$pics.url" } },
+          { $project: { pics: 0 } },
 
           // lastAssignment (Assign/Pro/De, not Retired) + ship info
           {
@@ -159,6 +173,8 @@ module.exports = async (req, res) => {
               as: "lastAssignment",
             },
           },
+
+          // Merge lastAssignment first, then the base doc -> base wins for colliding keys (e.g., name)
           {
             $replaceRoot: {
               newRoot: { $mergeObjects: [{ $arrayElemAt: ["$lastAssignment", 0] }, "$$ROOT"] },
@@ -166,31 +182,7 @@ module.exports = async (req, res) => {
           },
           { $project: { lastAssignment: 0 } },
 
-          // starshipCount = distinct starshipId count for Assignment events
-          {
-            $lookup: {
-              from: "events",
-              let: { id: "$_id" }, // we’ll correct this in next $addFields; using $._id can be brittle, so keep same behavior by new field below
-              pipeline: [
-                {
-                  $match: {
-                    $and: [
-                      { $expr: { $eq: ["$systemId", "$$id"] } },
-                      { type: "Assignment" },
-                      { starshipId: { $exists: true } },
-                    ],
-                  },
-                },
-                { $group: { _id: "$starshipId" } },
-                { $count: "vesslesNum" },
-              ],
-              as: "starshipAssignments",
-            },
-          },
-          { $addFields: { starshipCount: "$starshipAssignments.vesslesNum" } },
-          { $project: { starshipAssignments: 0 } },
-
-          // assignCount = Assignment|Promotion|Demotion total
+          // personnelCount = distinct officerId count for active Assign/Pro/De in this system
           {
             $lookup: {
               from: "events",
@@ -201,50 +193,70 @@ module.exports = async (req, res) => {
                     $and: [
                       { $expr: { $eq: ["$systemId", "$$id"] } },
                       { $or: [{ type: "Assignment" }, { type: "Promotion" }, { type: "Demotion" }] },
+                      { officerId: { $exists: true } },
+                      { position: { $ne: "Retired" } },
                     ],
                   },
                 },
-                { $count: "AssignProDeNum" },
+                { $group: { _id: "$officerId" } },
+                { $count: "n" },
               ],
-              as: "Assign-Pro-De",
+              as: "personnelAgg",
             },
           },
-          { $addFields: { assignCount: "$Assign-Pro-De.AssignProDeNum" } },
-          { $project: { "Assign-Pro-De": 0 } },
+          {
+            $addFields: {
+              personnelCount: { $ifNull: [{ $arrayElemAt: ["$personnelAgg.n", 0] }, 0] },
+            },
+          },
+          { $project: { personnelAgg: 0 } },
 
-          // missionCount = general missions
+          // maintenanceCount
+          {
+            $lookup: {
+              from: "events",
+              let: { id: "$_id" },
+              pipeline: [
+                { $match: { $and: [{ $expr: { $eq: ["$systemId", "$$id"] } }, { type: "Maintenance" }] } },
+                { $count: "n" },
+              ],
+              as: "maintenanceAgg",
+            },
+          },
+          { $addFields: { maintenanceCount: { $ifNull: [{ $arrayElemAt: ["$maintenanceAgg.n", 0] }, 0] } } },
+          { $project: { maintenanceAgg: 0 } },
+
+          // missionCount
           {
             $lookup: {
               from: "events",
               let: { id: "$_id" },
               pipeline: [
                 { $match: { $and: [{ $expr: { $eq: ["$systemId", "$$id"] } }, { type: "Mission" }] } },
-                { $count: "generalNum" },
+                { $count: "n" },
               ],
-              as: "generalMissions",
+              as: "missionAgg",
             },
           },
-          { $addFields: { missionCount: "$generalMissions.generalNum" } },
-          { $project: { generalMissions: 0 } },
+          { $addFields: { missionCount: { $ifNull: [{ $arrayElemAt: ["$missionAgg.n", 0] }, 0] } } },
+          { $project: { missionAgg: 0 } },
 
-          // lifeEventCount
+          // firstContactCount
           {
             $lookup: {
               from: "events",
               let: { id: "$_id" },
               pipeline: [
-                { $match: { $and: [{ $expr: { $eq: ["$systemId", "$$id"] } }, { type: "Life Event" }] } },
-                { $count: "lifeEventsNum" },
+                { $match: { $and: [{ $expr: { $eq: ["$systemId", "$$id"] } }, { type: "First Contact" }] } },
+                { $count: "n" },
               ],
-              as: "lifeEvents",
+              as: "firstContactAgg",
             },
           },
-          { $addFields: { lifeEventCount: "$lifeEvents.lifeEventsNum" } },
-          { $project: { lifeEvents: 0 } },
+          { $addFields: { firstContactCount: { $ifNull: [{ $arrayElemAt: ["$firstContactAgg.n", 0] }, 0] } } },
+          { $project: { firstContactAgg: 0 } },
         ];
 
-        // Fix small typo from legacy: ensure the 'let' var is the real _id
-        // (some drivers can be picky with "$._id"); doing an $addFields isn’t needed here
         const doc = await systemsCol.aggregate(pipeline, { allowDiskUse: true }).next();
 
         if (!doc) {
@@ -263,11 +275,11 @@ module.exports = async (req, res) => {
         if (doc.date) doc.date = toIsoOrNull(doc.date);
         if (doc.endDate) doc.endDate = toIsoOrNull(doc.endDate);
 
-        // Counts come back as arrays like [{vesslesNum: N}] projected into fields; keep legacy toString of arrays
-        if (doc.starshipCount != null) doc.starshipCount = String(doc.starshipCount);
-        if (doc.assignCount != null) doc.assignCount = String(doc.assignCount);
+        // Keep counts as strings (legacy)
+        if (doc.personnelCount != null) doc.personnelCount = String(doc.personnelCount);
+        if (doc.maintenanceCount != null) doc.maintenanceCount = String(doc.maintenanceCount);
         if (doc.missionCount != null) doc.missionCount = String(doc.missionCount);
-        if (doc.lifeEventCount != null) doc.lifeEventCount = String(doc.lifeEventCount);
+        if (doc.firstContactCount != null) doc.firstContactCount = String(doc.firstContactCount);
 
         res.statusCode = 200;
         res.setHeader("content-type", "application/json; charset=utf-8");
@@ -281,7 +293,9 @@ module.exports = async (req, res) => {
 
         if (newSystem.numOfPlanets != null) newSystem.numOfPlanets = parseInt(newSystem.numOfPlanets, 10);
         if (Array.isArray(newSystem.starTypes)) {
-          newSystem.starTypes = newSystem.starTypes.map((a) => (a && typeof a === "object" && "value" in a ? a.value : a));
+          newSystem.starTypes = newSystem.starTypes.map((a) =>
+            (a && typeof a === "object" && "value" in a ? a.value : a)
+          );
         }
 
         try {
@@ -333,7 +347,9 @@ module.exports = async (req, res) => {
 
         if (updatedInfo.numOfPlanets != null) updatedInfo.numOfPlanets = parseInt(updatedInfo.numOfPlanets, 10);
         if (Array.isArray(updatedInfo.starTypes)) {
-          updatedInfo.starTypes = updatedInfo.starTypes.map((a) => (a && typeof a === "object" && "value" in a ? a.value : a));
+          updatedInfo.starTypes = updatedInfo.starTypes.map((a) =>
+            (a && typeof a === "object" && "value" in a ? a.value : a)
+          );
         }
 
         delete updatedInfo["_id"];
