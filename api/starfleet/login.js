@@ -1,187 +1,162 @@
 // api/starfleet/login.js
+// Vercel-port of Realm "login" function (GET/POST only), matching original behavior and messages.
+
 const { getDb } = require("../../src/db");
 const { ObjectId } = require("bson");
+const jwt = require("jsonwebtoken");           // npm i jsonwebtoken
+const passwordHash = require("password-hash"); // npm i password-hash
 
-const jwt = require("jsonwebtoken");
-const passwordHash = require("password-hash");
-
-/* tiny utils */
-function readJSON(bodyOrReq) {
-  if (bodyOrReq && typeof bodyOrReq === "object" && !Buffer.isBuffer(bodyOrReq)) return bodyOrReq;
-  return new Promise((resolve) => {
-    if (!bodyOrReq || typeof bodyOrReq.on !== "function") return resolve({});
-    const chunks = [];
-    bodyOrReq.on("data", (c) => chunks.push(c));
-    bodyOrReq.on("end", () => {
-      const raw = Buffer.concat(chunks).toString("utf8");
-      try { resolve(raw ? JSON.parse(raw) : {}); } catch { resolve({}); }
+// ---- helpers ----
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => (data += chunk));
+    req.on("end", () => {
+      if (!data) return resolve({});
+      try {
+        resolve(JSON.parse(data));
+      } catch (e) {
+        reject(e);
+      }
     });
+    req.on("error", reject);
   });
 }
 
-function parseAuthBearer(req) {
-  const h = (req.headers && (req.headers.authorization || req.headers.Authorization)) || "";
-  const m = String(h).match(/^Bearer\s+(.+)$/i);
-  return m ? m[1] : null;
+function writeJSON(res, status, obj) {
+  res.statusCode = status;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(obj));
 }
 
-// Mirror your Realm user_login validation behavior (simple + returns field errors)
-function validateLoginInput(data) {
-  const errors = {};
-  const email = (data.email || "").trim();
-  const password = (data.password || "").trim();
-
-  if (!email) {
-    errors.email = "Email Field is Required";
-  } else {
-    // simple email check
-    const ok = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.toLowerCase());
-    if (!ok) errors.email = "Email is invalid";
-  }
-
-  if (!password) {
-    errors.password = "Password Field is Required";
-  }
-
-  return { errors, isValid: Object.keys(errors).length === 0 };
-}
+// Match Realm messages (including original typo “credientials”)
+const MSG_INVALID = { error: "401", message: "Invalid credientials, Please Sign In" };
+const MSG_BADLOGIN = { error: "404", message: "Email and/or Password Incorrect" };
 
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
 
-  // Let vercel.json attach CORS headers; just handle preflight quickly.
+  // OPTIONS preflight if needed
   if (method === "OPTIONS") {
     res.statusCode = 204;
     return res.end();
   }
 
-  // Get env secret (Realm used context.values.get('secretKey'))
-  const secretKey = process.env.secretKey || process.env.JWT_SECRET || "";
-  if (!secretKey) {
-    res.statusCode = 500;
-    res.setHeader("content-type", "application/json; charset=utf-8");
-    return res.end(JSON.stringify({ ok: false, error: "Missing secretKey env value" }));
+  const SECRET_KEY = process.env.SECRET_KEY;
+  if (!SECRET_KEY) {
+    return writeJSON(res, 500, { error: "500", message: "Missing SECRET_KEY" });
   }
 
   try {
     const db = await getDb();
     const users = db.collection("users");
 
+    // ---------------- GET ----------------
     if (method === "GET") {
-      // Validate current session from Authorization: Bearer <token>
       try {
-        const token = parseAuthBearer(req);
-        if (!token) throw new Error("no token");
+        const auth = req.headers.authorization || req.headers.Authorization || "";
+        if (!auth.startsWith("Bearer ")) {
+          return writeJSON(res, 200, MSG_INVALID); // original function returns JSON body (not HTTP 401)
+        }
 
-        // Verify signature; accept exp/iat as provided
-        const decoded = jwt.verify(token, secretKey);
+        const jwToken = auth.replace("Bearer ", "").trim();
 
-        // Realm logic: ensure the exact token exists in user's tokens array
+        // Decode WITHOUT verifying exp the Realm-way? The original used utils.jwt.decode(..., false)
+        // We'll decode AND verify signature, but allow for exp check as jwt.verify does by default.
+        let decoded;
+        try {
+          decoded = jwt.verify(jwToken, SECRET_KEY, { algorithms: ["HS256"] });
+        } catch (e) {
+          // If verification fails, mirror old contract:
+          return writeJSON(res, 200, MSG_INVALID);
+        }
+
         const user = await users.findOne({
           _id: new ObjectId(String(decoded._id)),
-          "tokens.token": token
-        }, { projection: { _id: 1, name: 1, email: 1, admin: 1 } });
+          "tokens.token": jwToken,
+        });
 
-        if (!user) throw new Error("token not found");
+        if (!user) {
+          return writeJSON(res, 200, MSG_INVALID);
+        }
 
-        res.statusCode = 200;
-        res.setHeader("content-type", "application/json; charset=utf-8");
-        return res.end(JSON.stringify({
+        return writeJSON(res, 200, {
           id: user._id.toString(),
           name: user.name,
           email: user.email,
-          admin: !!user.admin
-        }));
+          admin: !!user.admin,
+        });
       } catch {
-        // Mirror Realm’s error shape/wording
-        res.statusCode = 401;
-        res.setHeader("content-type", "application/json; charset=utf-8");
-        return res.end(JSON.stringify({ error: "401", message: "Invalid credientials, Please Sign In" }));
+        // Mirror original catch
+        return writeJSON(res, 200, MSG_INVALID);
       }
     }
 
+    // ---------------- POST ----------------
     if (method === "POST") {
-      // Sign in: validate body → verify password → issue JWT → push token into tokens[]
-      const body = await readJSON(req);
-      const { errors, isValid } = validateLoginInput(body);
-      if (!isValid) {
-        res.statusCode = 400;
-        res.setHeader("content-type", "application/json; charset=utf-8");
-        return res.end(JSON.stringify(errors));
+      const body = await readJsonBody(req);
+      // Realm called a separate validation function; we’ll enforce minimal checks inline
+      const email = (body.email || "").toString().trim().toLowerCase();
+      const password = (body.password || "").toString();
+
+      if (!email || !password) {
+        return writeJSON(res, 200, MSG_BADLOGIN);
       }
 
-      const email = String(body.email || "").toLowerCase();
-      const password = String(body.password || "");
-
-      // find user by email
-      let user = await users.findOne({ email });
-      if (!user) {
-        res.statusCode = 404;
-        res.setHeader("content-type", "application/json; charset=utf-8");
-        return res.end(JSON.stringify({ error: "404", message: "Email and/or Password Incorrect" }));
+      let userCheck;
+      try {
+        userCheck = await users.findOne({ email });
+        if (!userCheck) {
+          return writeJSON(res, 200, MSG_BADLOGIN);
+        }
+      } catch (e) {
+        return writeJSON(res, 200, { message: String(e) });
       }
 
-      // verify password (password-hash compatible)
-      const ok = passwordHash.verify(password, user.password || "");
-      if (!ok) {
-        res.statusCode = 404;
-        res.setHeader("content-type", "application/json; charset=utf-8");
-        return res.end(JSON.stringify({ error: "404", message: "Email and/or Password Incorrect" }));
+      // Verify password using password-hash (same as Realm)
+      const isMatch = (() => {
+        try {
+          // Typical stored string format works with passwordHash.verify
+          return passwordHash.verify(password, userCheck.password);
+        } catch {
+          return false;
+        }
+      })();
+
+      if (!isMatch) {
+        return writeJSON(res, 200, MSG_BADLOGIN);
       }
 
-      // create JWT, 365 days like Realm (they placed a Date in exp; we use standard exp)
-      const token = jwt.sign(
-        { _id: user._id.toString() },
-        secretKey,
-        { algorithm: "HS256", expiresIn: "365d" }
-      );
+      // Build 1-year token (matches your Realm logic with exp set a year ahead)
+      const now = new Date();
+      const exp = new Date(now);
+      exp.setDate(exp.getDate() + 365);
 
-      // push token into tokens array (each entry has its own _id + token), like Realm
-      const tokenDoc = { _id: new ObjectId(), token };
-      const tokens = Array.isArray(user.tokens) ? user.tokens.concat(tokenDoc) : [tokenDoc];
+      const tokenPayload = {
+        _id: userCheck._id.toString(),
+        iat: Math.floor(now.getTime() / 1000),
+        exp: Math.floor(exp.getTime() / 1000),
+      };
+
+      // Sign with HS256 using SECRET_KEY (Realm used utils.jwt.encode("HS256", ...))
+      const token = jwt.sign(tokenPayload, SECRET_KEY, { algorithm: "HS256" });
+
+      // Append token into users.tokens array
+      const tokens = Array.isArray(userCheck.tokens) ? userCheck.tokens.slice() : [];
+      tokens.push({ _id: new ObjectId(), token });
 
       await users.updateOne(
-        { _id: new ObjectId(user._id) },
+        { _id: new ObjectId(userCheck._id) },
         { $set: { tokens } }
       );
 
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json; charset=utf-8");
-      return res.end(JSON.stringify({ token, id: user._id.toString() }));
+      return writeJSON(res, 200, { token, id: userCheck._id.toString() });
     }
 
-    if (method === "DELETE") {
-      // Sign out: remove this bearer token from tokens[]
-      const token = parseAuthBearer(req);
-      if (!token) {
-        res.statusCode = 400;
-        res.setHeader("content-type", "application/json; charset=utf-8");
-        return res.end(JSON.stringify({ ok: false, error: "Missing Authorization Bearer token" }));
-      }
-
-      let decoded = null;
-      try { decoded = jwt.verify(token, secretKey); }
-      catch {
-        // still attempt to pull token by value, even if decode fails (parity with Realm token store)
-      }
-
-      const q = decoded ? { _id: new ObjectId(String(decoded._id)) } : { "tokens.token": token };
-      const r = await users.updateOne(q, { $pull: { tokens: { token } } });
-
-      const ok = r.modifiedCount > 0 || r.matchedCount > 0;
-      res.statusCode = ok ? 200 : 404;
-      res.setHeader("content-type", "application/json; charset=utf-8");
-      return res.end(JSON.stringify({ ok }));
-    }
-
-    // Method not allowed
-    res.statusCode = 405;
-    res.setHeader("Allow", "GET, POST, DELETE, OPTIONS");
-    res.setHeader("content-type", "application/json; charset=utf-8");
-    return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+    // Fallback
+    res.setHeader("Allow", "GET, POST, OPTIONS");
+    return writeJSON(res, 405, { error: "405", message: "Method Not Allowed" });
   } catch (e) {
-    res.statusCode = 500;
-    res.setHeader("content-type", "application/json; charset=utf-8");
-    return res.end(JSON.stringify({ ok: false, error: e.message || "Internal error" }));
+    return writeJSON(res, 500, { error: "500", message: e.message || "Internal error" });
   }
 };
