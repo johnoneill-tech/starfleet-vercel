@@ -9,7 +9,7 @@ function isHex24(s) {
 function toObjectId(v) {
   if (!v) return v;
   if (isHex24(v)) return new ObjectId(v);
-  return v; // allow legacy string ids if any existed
+  return v;
 }
 function toIsoOrNull(d) {
   try {
@@ -52,8 +52,8 @@ module.exports = async (req, res) => {
         const u = new URL(req.url, "http://local");
         const id = u.searchParams.get("id");
 
+        // ---- LIST (search) ----
         if (!id) {
-          // ---- List mode ----
           const systemsPerPage = Number(u.searchParams.get("systemsPerPage") || 10);
           const page = Number(u.searchParams.get("page") || 0);
 
@@ -104,11 +104,11 @@ module.exports = async (req, res) => {
           );
         }
 
-        // ---- Detail by id ----
+        // ---- DETAIL ----
         const pipeline = [
           { $match: { _id: toObjectId(id) } },
 
-          // Primary photo for the system (to match list shape)
+          // Include primary photo (for consistency with list and PhotoCarousel UX)
           {
             $lookup: {
               from: "photos",
@@ -122,139 +122,6 @@ module.exports = async (req, res) => {
           },
           { $addFields: { picUrl: "$pics.url" } },
           { $project: { pics: 0 } },
-
-          // lastAssignment (Assign/Pro/De, not Retired) + ship info
-          {
-            $lookup: {
-              from: "events",
-              let: { id: "$_id" },
-              pipeline: [
-                {
-                  $match: {
-                    $and: [
-                      { $expr: { $eq: ["$systemId", "$$id"] } },
-                      { $or: [{ type: "Assignment" }, { type: "Promotion" }, { type: "Demotion" }] },
-                      { position: { $ne: "Retired" } },
-                    ],
-                  },
-                },
-                { $sort: { date: -1 } },
-                { $limit: 1 },
-                {
-                  $project: {
-                    rankLabel: 1,
-                    position: 1,
-                    provisional: 1,
-                    location: 1,
-                    date: 1,
-                    endDate: 1,
-                    starshipId: 1,
-                    _id: 0,
-                  },
-                },
-                {
-                  $lookup: {
-                    from: "starships",
-                    let: { id: "$starshipId" },
-                    pipeline: [
-                      { $match: { $expr: { $eq: ["$_id", "$$id"] } } },
-                      { $project: { _id: 0, name: 1, registry: 1 } },
-                    ],
-                    as: "starshipInfo",
-                  },
-                },
-                {
-                  $replaceRoot: {
-                    newRoot: { $mergeObjects: [{ $arrayElemAt: ["$starshipInfo", 0] }, "$$ROOT"] },
-                  },
-                },
-                { $project: { starshipInfo: 0 } },
-              ],
-              as: "lastAssignment",
-            },
-          },
-
-          // Merge lastAssignment first, then the base doc -> base wins for colliding keys (e.g., name)
-          {
-            $replaceRoot: {
-              newRoot: { $mergeObjects: [{ $arrayElemAt: ["$lastAssignment", 0] }, "$$ROOT"] },
-            },
-          },
-          { $project: { lastAssignment: 0 } },
-
-          // personnelCount = distinct officerId count for active Assign/Pro/De in this system
-          {
-            $lookup: {
-              from: "events",
-              let: { id: "$_id" },
-              pipeline: [
-                {
-                  $match: {
-                    $and: [
-                      { $expr: { $eq: ["$systemId", "$$id"] } },
-                      { $or: [{ type: "Assignment" }, { type: "Promotion" }, { type: "Demotion" }] },
-                      { officerId: { $exists: true } },
-                      { position: { $ne: "Retired" } },
-                    ],
-                  },
-                },
-                { $group: { _id: "$officerId" } },
-                { $count: "n" },
-              ],
-              as: "personnelAgg",
-            },
-          },
-          {
-            $addFields: {
-              personnelCount: { $ifNull: [{ $arrayElemAt: ["$personnelAgg.n", 0] }, 0] },
-            },
-          },
-          { $project: { personnelAgg: 0 } },
-
-          // maintenanceCount
-          {
-            $lookup: {
-              from: "events",
-              let: { id: "$_id" },
-              pipeline: [
-                { $match: { $and: [{ $expr: { $eq: ["$systemId", "$$id"] } }, { type: "Maintenance" }] } },
-                { $count: "n" },
-              ],
-              as: "maintenanceAgg",
-            },
-          },
-          { $addFields: { maintenanceCount: { $ifNull: [{ $arrayElemAt: ["$maintenanceAgg.n", 0] }, 0] } } },
-          { $project: { maintenanceAgg: 0 } },
-
-          // missionCount
-          {
-            $lookup: {
-              from: "events",
-              let: { id: "$_id" },
-              pipeline: [
-                { $match: { $and: [{ $expr: { $eq: ["$systemId", "$$id"] } }, { type: "Mission" }] } },
-                { $count: "n" },
-              ],
-              as: "missionAgg",
-            },
-          },
-          { $addFields: { missionCount: { $ifNull: [{ $arrayElemAt: ["$missionAgg.n", 0] }, 0] } } },
-          { $project: { missionAgg: 0 } },
-
-          // firstContactCount
-          {
-            $lookup: {
-              from: "events",
-              let: { id: "$_id" },
-              pipeline: [
-                { $match: { $and: [{ $expr: { $eq: ["$systemId", "$$id"] } }, { type: "First Contact" }] } },
-                { $count: "n" },
-              ],
-              as: "firstContactAgg",
-            },
-          },
-          { $addFields: { firstContactCount: { $ifNull: [{ $arrayElemAt: ["$firstContactAgg.n", 0] }, 0] } } },
-          { $project: { firstContactAgg: 0 } },
         ];
 
         const doc = await systemsCol.aggregate(pipeline, { allowDiskUse: true }).next();
@@ -265,7 +132,7 @@ module.exports = async (req, res) => {
           return res.end(JSON.stringify({ message: "Not found" }));
         }
 
-        // Legacy output conversions
+        // Basic legacy conversions
         doc._id = String(doc._id);
         if (doc.starshipId) doc.starshipId = String(doc.starshipId);
         if (doc.species_id) doc.species_id = String(doc.species_id);
@@ -274,12 +141,7 @@ module.exports = async (req, res) => {
         if (doc.deathDate) doc.deathDate = toIsoOrNull(doc.deathDate);
         if (doc.date) doc.date = toIsoOrNull(doc.date);
         if (doc.endDate) doc.endDate = toIsoOrNull(doc.endDate);
-
-        // Keep counts as strings (legacy)
-        if (doc.personnelCount != null) doc.personnelCount = String(doc.personnelCount);
-        if (doc.maintenanceCount != null) doc.maintenanceCount = String(doc.maintenanceCount);
-        if (doc.missionCount != null) doc.missionCount = String(doc.missionCount);
-        if (doc.firstContactCount != null) doc.firstContactCount = String(doc.firstContactCount);
+        if (doc.numOfPlanets != null) doc.numOfPlanets = String(doc.numOfPlanets);
 
         res.statusCode = 200;
         res.setHeader("content-type", "application/json; charset=utf-8");
@@ -324,7 +186,7 @@ module.exports = async (req, res) => {
           await systemsCol.deleteOne({ _id: new ObjectId(id) });
           res.statusCode = 200;
           res.setHeader("content-type", "application/json; charset=utf-8");
-          return res.end(JSON.stringify({ message: "Personnel Record Successfully Deleted" }));
+          return res.end(JSON.stringify({ message: "System Record Successfully Deleted" }));
         } catch (err) {
           res.statusCode = 500;
           res.setHeader("content-type", "application/json; charset=utf-8");
