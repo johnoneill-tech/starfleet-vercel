@@ -1,272 +1,232 @@
-// api/starfleet/starships.js
+// src/routes/starships.js
+// Search + detail (with picUrl[]), plus POST/PUT/DELETE for edits.
+// Matches your legacy shapes and messages.
+
 const { getDb } = require("../db");
 const { ObjectId } = require("bson");
 
-function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+// -------- helpers ----------
+function isHex24(s) {
+  return typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s);
+}
+function toObjectId(v) {
+  if (!v) return v;
+  return isHex24(v) ? new ObjectId(v) : v;
+}
+function toIsoOrNull(d) {
+  try {
+    if (!d) return null;
+    const dd = new Date(d);
+    return isNaN(dd.getTime()) ? null : dd.toISOString();
+  } catch { return null; }
+}
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (c) => (data += c));
+    req.on("end", () => {
+      if (!data) return resolve({});
+      try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+    });
+    req.on("error", reject);
+  });
+}
 
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
-  if (method === "OPTIONS") { res.statusCode = 204; return res.end(); }
-  if (method !== "GET") {
-    res.statusCode = 405;
-    res.setHeader("Allow", "GET, OPTIONS");
-    res.setHeader("content-type", "application/json; charset=utf-8");
-    return res.end(JSON.stringify({ message: "Method Not Allowed" }));
-  }
+  const db = await getDb();
+  const ships = db.collection("starships");
+  const photos = db.collection("photos"); // used in lookups
 
   try {
-    const db = await getDb();
-    const col = db.collection("starships");
-    const u = new URL(req.url || req.originalUrl || "/", "http://local");
-    const id = u.searchParams.get("id");
+    // =================== GET ===================
+    if (method === "GET") {
+      const u = new URL(req.url, "http://local");
+      const id = u.searchParams.get("id");
 
-    // ---------- DETAIL (returns full doc with picUrl: string[]) ----------
-    if (id) {
-      if (!/^[0-9a-fA-F]{24}$/.test(id)) {
-        res.statusCode = 400;
-        res.setHeader("content-type","application/json; charset=utf-8");
-        return res.end(JSON.stringify({ message: "Invalid id" }));
+      // ------- LIST -------
+      if (!id) {
+        const perPage = Number(u.searchParams.get("starshipsPerPage") || 12);
+        const page = Number(u.searchParams.get("page") || 0);
+        const name = u.searchParams.get("name");
+        const classFilter = u.searchParams.get("class"); // e.g., "All" | "Constitution" | etc.
+        // timeframe is ignored (frontend sends "all")
+        // const timeframe = u.searchParams.get("timeframe");
+
+        let query = {};
+        if (name) query.name = { $regex: "^" + name + ".*", $options: "i" };
+        if (classFilter && classFilter !== "All") query.class = classFilter;
+
+        const pipeline = [
+          { $match: query },
+          {
+            $lookup: {
+              from: "photos",
+              let: { id: "$_id" },
+              pipeline: [
+                { $match: { $expr: { $eq: ["$owner", "$$id"] } } },
+                { $sort: { primary: -1, _id: 1 } }, // primary first
+                { $project: { _id: 0, url: 1 } },
+              ],
+              as: "pics",
+            },
+          },
+          { $addFields: { picUrl: "$pics.url" } },
+          { $project: { pics: 0 } },
+          { $sort: { name: 1 } },
+          { $skip: page * perPage },
+          { $limit: perPage },
+        ];
+
+        const list = await ships.aggregate(pipeline, { allowDiskUse: true }).toArray();
+        for (const s of list) {
+          if (s._id) s._id = String(s._id);
+          if (s.ship_id) s.ship_id = String(s.ship_id);
+        }
+
+        const total = await ships.countDocuments(query);
+
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(
+          JSON.stringify({
+            starships: list,
+            page: String(page),
+            entries_per_page: String(perPage),
+            total_results: String(total),
+          })
+        );
       }
 
+      // ------- DETAIL -------
       const pipeline = [
-        { $match: { _id: new ObjectId(id) } },
-
-        // photos: primary[] first, then newest others[]; compare as strings
+        { $match: { _id: toObjectId(id) } },
         {
           $lookup: {
             from: "photos",
             let: { id: "$_id" },
             pipeline: [
-              {
-                $match: {
-                  $and: [
-                    {
-                      $expr: {
-                        $eq: [
-                          { $toString: "$owner" },
-                          { $toString: "$$id" }
-                        ]
-                      }
-                    },
-                    { primary: true }
-                  ]
-                }
-              },
-              { $sort: { created_at: -1, _id: -1 } },
-              { $project: { _id: 0, url: 1 } }
+              { $match: { $expr: { $eq: ["$owner", "$$id"] } } },
+              { $sort: { primary: -1, _id: 1 } },
+              { $project: { _id: 0, url: 1 } },
             ],
-            as: "primaryPics"
-          }
+            as: "pics",
+          },
         },
-        {
-          $lookup: {
-            from: "photos",
-            let: { id: "$_id" },
-            pipeline: [
-              {
-                $match: {
-                  $expr: {
-                    $or: [
-                      {
-                        $eq: [
-                          { $toString: "$owner" },
-                          { $toString: "$$id" }
-                        ]
-                      },
-                      {
-                        $eq: [
-                          { $toString: "$subject_id" },
-                          { $toString: "$$id" }
-                        ]
-                      }
-                    ]
-                  }
-                }
-              },
-              { $sort: { created_at: -1, _id: -1 } },
-              { $project: { _id: 0, url: 1, primary: 1 } }
-            ],
-            as: "allPics"
-          }
-        },
-        {
-          $addFields: {
-            picUrl: {
-              $concatArrays: [
-                { $ifNull: ["$primaryPics.url", []] },
-                {
-                  $map: {
-                    input: {
-                      $filter: {
-                        input: "$allPics",
-                        as: "p",
-                        cond: { $ne: ["$$p.primary", true] }
-                      }
-                    },
-                    as: "p",
-                    in: "$$p.url"
-                  }
-                }
-              ]
-            }
-          }
-        },
-        { $project: { primaryPics: 0, allPics: 0 } },
-
-        // counts
-        {
-          $lookup: {
-            from: "events",
-            let: { id: "$_id" },
-            pipeline: [
-              { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Assignment" }] } },
-              { $group: { _id: "$officerId" } },
-              { $count: "personnelNum" }
-            ],
-            as: "personnelAssignments"
-          }
-        },
-        { $addFields: { personnelCount: "$personnelAssignments.personnelNum" } },
-        { $project: { personnelAssignments: 0 } },
-        {
-          $lookup: {
-            from: "events",
-            let: { id: "$_id" },
-            pipeline: [
-              { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Mission" }, { officerId: { $exists: false } }] } },
-              { $count: "missonNum" }
-            ],
-            as: "missions"
-          }
-        },
-        { $addFields: { missionCount: "$missions.missonNum" } },
-        { $project: { missions: 0 } }
+        { $addFields: { picUrl: "$pics.url" } },
+        { $project: { pics: 0 } },
       ];
 
-      let doc = await col.aggregate(pipeline).next();
-      if (!doc) { res.statusCode = 404; res.setHeader("content-type","application/json; charset=utf-8"); return res.end(JSON.stringify({ message: "Not Found" })); }
+      const doc = await ships.aggregate(pipeline, { allowDiskUse: true }).next();
+      if (!doc) {
+        res.statusCode = 404;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Not found" }));
+      }
 
+      // legacy conversions
       doc._id = String(doc._id);
-      ["launch_date","commission_date","decommission_date","destruction_date"].forEach(k => { if (doc[k]) doc[k] = new Date(doc[k]).toISOString(); });
-      if (doc.personnelCount) doc.personnelCount = doc.personnelCount.toString();
-      if (doc.missionCount) doc.missionCount = doc.missionCount.toString();
-      if (doc.ship_id != null) doc.ship_id = String(doc.ship_id);
+      if (doc.ship_id) doc.ship_id = String(doc.ship_id);
+      if (doc.commission_date) doc.commission_date = toIsoOrNull(doc.commission_date);
+      if (doc.decommission_date) doc.decommission_date = toIsoOrNull(doc.decommission_date);
+      if (doc.launch_date) doc.launch_date = toIsoOrNull(doc.launch_date);
+      if (doc.destruction_date) doc.destruction_date = toIsoOrNull(doc.destruction_date);
 
       res.statusCode = 200;
-      res.setHeader("content-type","application/json; charset=utf-8");
+      res.setHeader("content-type", "application/json; charset=utf-8");
       return res.end(JSON.stringify(doc));
     }
 
-    // ---------- LIST (primary only; fast) ----------
-    let starshipsPerPage = parseInt(u.searchParams.get("starshipsPerPage") || "12", 10);
-    const page = parseInt(u.searchParams.get("page") || "0", 10);
-    const name = (u.searchParams.get("name") || "").trim();
-    const klass = (u.searchParams.get("class") || "").trim();
-    const timeframe = (u.searchParams.get("timeframe") || "").trim();
+    // =================== POST ===================
+    if (method === "POST") {
+      const body = await readJsonBody(req);
+      const doc = { ...body };
 
-    let nameQuery = {};
-    if (name) nameQuery = { name: { $regex: "^" + escRe(name) + ".*", $options: "i" } };
+      // cast dates if present
+      for (const k of ["commission_date", "decommission_date", "launch_date", "destruction_date"]) {
+        if (doc[k]) doc[k] = new Date(doc[k]);
+      }
+      // cast numeric-ish fields you might have
+      for (const k of ["crew_complement", "length", "width", "height"]) {
+        if (doc[k] != null && doc[k] !== "") doc[k] = Number(doc[k]);
+      }
 
-    let classQuery = {};
-    if (klass && klass !== "All") {
-      if (klass === "Unknown") {
-        classQuery = { $or: [{ class: { $exists: false } }, { class: null }, { class: "" }] };
-      } else {
-        classQuery = { class: { $regex: "^" + escRe(klass) + "$", $options: "i" } };
+      try {
+        await ships.insertOne(doc);
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Record Inserted Successfully" }));
+      } catch (err) {
+        res.statusCode = 500;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: `Record Insert Failed ${err.message}` }));
       }
     }
 
-    let startTimeFrame = 0, endTimeFrame = 999999;
-    if (timeframe === "22nd") { startTimeFrame = 0; endTimeFrame = 400; }
-    if (timeframe === "23rd") { startTimeFrame = 400; endTimeFrame = 2500; }
-    if (timeframe === "24th") { startTimeFrame = 2500; endTimeFrame = 110000; }
-    if (timeframe === "32nd") { startTimeFrame = 110000; endTimeFrame = 999999; }
-    const timeQuery = { $and: [{ ship_id: { $gte: startTimeFrame } }, { ship_id: { $lt: endTimeFrame } }] };
+    // =================== PUT ===================
+    if (method === "PUT") {
+      const body = await readJsonBody(req);
+      const starshipId = body._id;
+      if (!starshipId || !isHex24(String(starshipId))) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Valid _id is required" }));
+      }
 
-    const and = [];
-    if (Object.keys(nameQuery).length) and.push(nameQuery);
-    if (Object.keys(classQuery).length) and.push(classQuery);
-    and.push(timeQuery);
-    const query = and.length ? { $and: and } : { _id: { $exists: true } };
+      const updated = { ...body };
+      delete updated._id;
 
-    const list = await col.aggregate([
-      { $match: query },
-      {
-        $lookup: {
-          from: "photos",
-          let: { id: "$_id" },
-          pipeline: [
-            {
-              $match: {
-                $and: [
-                  {
-                    $expr: {
-                      $eq: [
-                        { $toString: "$owner" },
-                        { $toString: "$$id" }
-                      ]
-                    }
-                  },
-                  { primary: true }
-                ]
-              }
-            },
-            { $project: { _id: 0, url: 1 } }
-          ],
-          as: "shipPics"
-        }
-      },
-      { $addFields: { picUrl: "$shipPics.url" } },
-      { $project: { shipPics: 0 } },
-      {
-        $lookup: {
-          from: "events",
-          let: { id: "$_id" },
-          pipeline: [
-            { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Assignment" }] } },
-            { $group: { _id: "$officerId" } },
-            { $count: "personnelNum" }
-          ],
-          as: "personnelAssignments"
-        }
-      },
-      { $addFields: { personnelCount: "$personnelAssignments.personnelNum" } },
-      { $project: { personnelAssignments: 0 } },
-      {
-        $lookup: {
-          from: "events",
-          let: { id: "$_id" },
-          pipeline: [
-            { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$id"] } }, { type: "Mission" }, { officerId: { $exists: false } }] } },
-            { $count: "missonNum" }
-          ],
-          as: "missions"
-        }
-      },
-      { $addFields: { missionCount: "$missions.missonNum" } },
-      { $project: { missions: 0 } },
-      { $sort: { ship_id: 1 } },
-      { $skip: page * starshipsPerPage },
-      { $limit: starshipsPerPage }
-    ]).toArray();
+      // cast dates if present
+      for (const k of ["commission_date", "decommission_date", "launch_date", "destruction_date"]) {
+        if (updated[k]) updated[k] = new Date(updated[k]);
+      }
+      // numeric casts
+      for (const k of ["crew_complement", "length", "width", "height"]) {
+        if (updated[k] != null && updated[k] !== "") updated[k] = Number(updated[k]);
+      }
 
-    list.forEach(s => {
-      s._id = String(s._id);
-      if (s.ship_id != null) s.ship_id = String(s.ship_id);
-    });
+      try {
+        await ships.updateOne({ _id: new ObjectId(starshipId) }, { $set: updated });
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Record Updated Successfully" }));
+      } catch (err) {
+        res.statusCode = 500;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: `Record Update Failed ${err.message}` }));
+      }
+    }
 
-    const total = await col.countDocuments(query);
-    res.statusCode = 200;
-    res.setHeader("content-type","application/json; charset=utf-8");
-    return res.end(JSON.stringify({
-      starships: list,
-      page: String(page),
-      entries_per_page: String(starshipsPerPage),
-      total_results: String(total)
-    }));
+    // =================== DELETE ===================
+    if (method === "DELETE") {
+      const u = new URL(req.url, "http://local");
+      const id = u.searchParams.get("id");
+      if (!id || !isHex24(id)) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Valid id is required" }));
+      }
+
+      try {
+        await ships.deleteOne({ _id: new ObjectId(id) });
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Starship Record Successfully Deleted" }));
+      } catch (err) {
+        res.statusCode = 500;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: `Deletion of Record Failed ${err.message}` }));
+      }
+    }
+
+    // Fallback
+    res.statusCode = 405;
+    res.setHeader("Allow", "GET, POST, PUT, DELETE");
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    return res.end(JSON.stringify({ message: "Method Not Allowed" }));
   } catch (e) {
     res.statusCode = 500;
-    res.setHeader("content-type","application/json; charset=utf-8");
+    res.setHeader("content-type", "application/json; charset=utf-8");
     return res.end(JSON.stringify({ message: e.message || "Internal error" }));
   }
 };
