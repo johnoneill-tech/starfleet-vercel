@@ -1,6 +1,5 @@
 // src/routes/starships.js
-// Search + detail (with picUrl[]), plus POST/PUT/DELETE for edits.
-// Matches your legacy shapes and messages.
+// Search + detail (with picUrl[]), CRUD, and detail-level counts for UI buttons.
 
 const { getDb } = require("../db");
 const { ObjectId } = require("bson");
@@ -36,7 +35,6 @@ module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
   const db = await getDb();
   const ships = db.collection("starships");
-  const photos = db.collection("photos"); // used in lookups
 
   try {
     // =================== GET ===================
@@ -49,9 +47,8 @@ module.exports = async (req, res) => {
         const perPage = Number(u.searchParams.get("starshipsPerPage") || 12);
         const page = Number(u.searchParams.get("page") || 0);
         const name = u.searchParams.get("name");
-        const classFilter = u.searchParams.get("class"); // e.g., "All" | "Constitution" | etc.
-        // timeframe is ignored (frontend sends "all")
-        // const timeframe = u.searchParams.get("timeframe");
+        const classFilter = u.searchParams.get("class"); // "All" | actual class
+        // timeframe ignored (frontend sends "all")
 
         let query = {};
         if (name) query.name = { $regex: "^" + name + ".*", $options: "i" };
@@ -98,9 +95,11 @@ module.exports = async (req, res) => {
         );
       }
 
-      // ------- DETAIL -------
+      // ------- DETAIL (with counts) -------
       const pipeline = [
         { $match: { _id: toObjectId(id) } },
+
+        // pictures (primary first)
         {
           $lookup: {
             from: "photos",
@@ -115,6 +114,78 @@ module.exports = async (req, res) => {
         },
         { $addFields: { picUrl: "$pics.url" } },
         { $project: { pics: 0 } },
+
+        // ---- COUNTS from events ----
+
+        // 1) personnelCount = distinct officers involved in Assign/Pro/Dem events for this ship
+        {
+          $lookup: {
+            from: "events",
+            let: { sid: "$_id" },
+            pipeline: [
+              {
+                $match: {
+                  $and: [
+                    { $expr: { $eq: ["$starshipId", "$$sid"] } },
+                    { $or: [{ type: "Assignment" }, { type: "Promotion" }, { type: "Demotion" }] },
+                    { officerId: { $exists: true } },
+                    { position: { $ne: "Retired" } }, // mirror legacy filter
+                  ],
+                },
+              },
+              { $group: { _id: "$officerId" } },
+              { $count: "count" },
+            ],
+            as: "personnelAgg",
+          },
+        },
+        { $addFields: { personnelCount: { $ifNull: [{ $arrayElemAt: ["$personnelAgg.count", 0] }, 0] } } },
+        { $project: { personnelAgg: 0 } },
+
+        // 2) missionCount
+        {
+          $lookup: {
+            from: "events",
+            let: { sid: "$_id" },
+            pipeline: [
+              { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$sid"] } }, { type: "Mission" }] } },
+              { $count: "count" },
+            ],
+            as: "missionAgg",
+          },
+        },
+        { $addFields: { missionCount: { $ifNull: [{ $arrayElemAt: ["$missionAgg.count", 0] }, 0] } } },
+        { $project: { missionAgg: 0 } },
+
+        // 3) maintenanceCount
+        {
+          $lookup: {
+            from: "events",
+            let: { sid: "$_id" },
+            pipeline: [
+              { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$sid"] } }, { type: "Maintenance" }] } },
+              { $count: "count" },
+            ],
+            as: "maintAgg",
+          },
+        },
+        { $addFields: { maintenanceCount: { $ifNull: [{ $arrayElemAt: ["$maintAgg.count", 0] }, 0] } } },
+        { $project: { maintAgg: 0 } },
+
+        // 4) firstContactCount
+        {
+          $lookup: {
+            from: "events",
+            let: { sid: "$_id" },
+            pipeline: [
+              { $match: { $and: [{ $expr: { $eq: ["$starshipId", "$$sid"] } }, { type: "First Contact" }] } },
+              { $count: "count" },
+            ],
+            as: "fcAgg",
+          },
+        },
+        { $addFields: { firstContactCount: { $ifNull: [{ $arrayElemAt: ["$fcAgg.count", 0] }, 0] } } },
+        { $project: { fcAgg: 0 } },
       ];
 
       const doc = await ships.aggregate(pipeline, { allowDiskUse: true }).next();
@@ -127,10 +198,9 @@ module.exports = async (req, res) => {
       // legacy conversions
       doc._id = String(doc._id);
       if (doc.ship_id) doc.ship_id = String(doc.ship_id);
-      if (doc.commission_date) doc.commission_date = toIsoOrNull(doc.commission_date);
-      if (doc.decommission_date) doc.decommission_date = toIsoOrNull(doc.decommission_date);
-      if (doc.launch_date) doc.launch_date = toIsoOrNull(doc.launch_date);
-      if (doc.destruction_date) doc.destruction_date = toIsoOrNull(doc.destruction_date);
+      for (const k of ["commission_date", "decommission_date", "launch_date", "destruction_date"]) {
+        if (doc[k]) doc[k] = toIsoOrNull(doc[k]);
+      }
 
       res.statusCode = 200;
       res.setHeader("content-type", "application/json; charset=utf-8");
@@ -146,7 +216,7 @@ module.exports = async (req, res) => {
       for (const k of ["commission_date", "decommission_date", "launch_date", "destruction_date"]) {
         if (doc[k]) doc[k] = new Date(doc[k]);
       }
-      // cast numeric-ish fields you might have
+      // numeric-ish fields
       for (const k of ["crew_complement", "length", "width", "height"]) {
         if (doc[k] != null && doc[k] !== "") doc[k] = Number(doc[k]);
       }
