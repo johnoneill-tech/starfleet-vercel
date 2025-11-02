@@ -1,6 +1,6 @@
 // src/routes/personnel.js
-// Search + detail (with picUrl[]), lastAssignment merged into root, and CRUD.
-// Counts included: assignCount, missionCount, lifeEventCount.
+// Search + detail (with picUrl[]), lastAssignment merged into root, CRUD,
+// and counts: assignCount, missionCount, lifeEventCount, starshipCount.
 
 const { getDb } = require("../db");
 const { ObjectId } = require("bson");
@@ -47,7 +47,7 @@ module.exports = async (req, res) => {
       if (!id) {
         const perPage = Number(u.searchParams.get("personnelPerPage") || 10);
         const page = Number(u.searchParams.get("page") || 0);
-        const name = u.searchParams.get("name"); // prefix match
+        const name = u.searchParams.get("name");
 
         let query = {};
         if (name) {
@@ -105,7 +105,7 @@ module.exports = async (req, res) => {
         );
       }
 
-      // ------- DETAIL (pics + lastAssignment + counts) -------
+      // ------- DETAIL (pics + lastAssignment + counts incl. starshipCount) -------
       const pipeline = [
         { $match: { _id: toObjectId(id) } },
 
@@ -185,7 +185,7 @@ module.exports = async (req, res) => {
 
         // ---- COUNTS from events for this officer ----
 
-        // Assign/Pro/Dem
+        // Assign/Pro/Dem total count (all events)
         {
           $lookup: {
             from: "events",
@@ -206,6 +206,30 @@ module.exports = async (req, res) => {
         },
         { $addFields: { assignCount: { $ifNull: [{ $arrayElemAt: ["$apdAgg.count", 0] }, 0] } } },
         { $project: { apdAgg: 0 } },
+
+        // Distinct starships served on (for "Starship Assignments" count)
+        {
+          $lookup: {
+            from: "events",
+            let: { oid: "$_id" },
+            pipeline: [
+              {
+                $match: {
+                  $and: [
+                    { $expr: { $eq: ["$officerId", "$$oid"] } },
+                    { $or: [{ type: "Assignment" }, { type: "Promotion" }, { type: "Demotion" }] },
+                    { starshipId: { $exists: true } },
+                  ],
+                },
+              },
+              { $group: { _id: "$starshipId" } },
+              { $count: "count" },
+            ],
+            as: "shipAgg",
+          },
+        },
+        { $addFields: { starshipCount: { $ifNull: [{ $arrayElemAt: ["$shipAgg.count", 0] }, 0] } } },
+        { $project: { shipAgg: 0 } },
 
         // Missions
         {
@@ -264,7 +288,6 @@ module.exports = async (req, res) => {
       const body = await readJsonBody(req);
       const doc = { ...body };
 
-      // cast refs/dates
       if (doc.species_id) doc.species_id = toObjectId(doc.species_id);
       if (doc.birthDate) doc.birthDate = new Date(doc.birthDate);
       if (doc.deathDate) doc.deathDate = new Date(doc.deathDate);
