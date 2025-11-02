@@ -1,6 +1,6 @@
 // src/routes/personnel.js
-// Search + detail (with picUrl[]), CRUD, and detail-level counts.
-// Mirrors the legacy Realm behavior/JSON your frontend expects.
+// Search + detail (with picUrl[]), lastAssignment merged into root, and CRUD.
+// Counts included: assignCount, missionCount, lifeEventCount.
 
 const { getDb } = require("../db");
 const { ObjectId } = require("bson");
@@ -47,7 +47,7 @@ module.exports = async (req, res) => {
       if (!id) {
         const perPage = Number(u.searchParams.get("personnelPerPage") || 10);
         const page = Number(u.searchParams.get("page") || 0);
-        const name = u.searchParams.get("name"); // prefix match like old code
+        const name = u.searchParams.get("name"); // prefix match
 
         let query = {};
         if (name) {
@@ -57,7 +57,7 @@ module.exports = async (req, res) => {
               { first:   { $regex: "^" + name + ".*", $options: "i" } },
               { middle:  { $regex: "^" + name + ".*", $options: "i" } },
               { alias:   { $regex: "^" + name + ".*", $options: "i" } },
-              { name:    { $regex: "^" + name + ".*", $options: "i" } }, // in case you store full name
+              { name:    { $regex: "^" + name + ".*", $options: "i" } },
             ],
           };
         }
@@ -70,7 +70,7 @@ module.exports = async (req, res) => {
               let: { id: "$_id" },
               pipeline: [
                 { $match: { $expr: { $eq: ["$owner", "$$id"] } } },
-                { $sort: { primary: -1, _id: 1 } }, // primary first
+                { $sort: { primary: -1, _id: 1 } },
                 { $project: { _id: 0, url: 1 } },
               ],
               as: "pics",
@@ -105,7 +105,7 @@ module.exports = async (req, res) => {
         );
       }
 
-      // ------- DETAIL (with counts used by UI buttons) -------
+      // ------- DETAIL (pics + lastAssignment + counts) -------
       const pipeline = [
         { $match: { _id: toObjectId(id) } },
 
@@ -125,9 +125,67 @@ module.exports = async (req, res) => {
         { $addFields: { picUrl: "$pics.url" } },
         { $project: { pics: 0 } },
 
+        // ---- LAST ASSIGNMENT (Assignment/Promotion/Demotion, not Retired) ----
+        {
+          $lookup: {
+            from: "events",
+            let: { oid: "$_id" },
+            pipeline: [
+              {
+                $match: {
+                  $and: [
+                    { $expr: { $eq: ["$officerId", "$$oid"] } },
+                    { $or: [{ type: "Assignment" }, { type: "Promotion" }, { type: "Demotion" }] },
+                    { position: { $ne: "Retired" } },
+                  ],
+                },
+              },
+              { $sort: { date: -1 } },
+              { $limit: 1 },
+              {
+                $project: {
+                  rankLabel: 1,
+                  position: 1,
+                  provisional: 1,
+                  location: 1,
+                  date: 1,
+                  endDate: 1,
+                  starshipId: 1,
+                  _id: 0,
+                },
+              },
+              {
+                $lookup: {
+                  from: "starships",
+                  let: { sid: "$starshipId" },
+                  pipeline: [
+                    { $match: { $expr: { $eq: ["$_id", "$$sid"] } } },
+                    { $project: { _id: 0, name: 1, registry: 1, class: 1 } },
+                  ],
+                  as: "starshipInfo",
+                },
+              },
+              {
+                $replaceRoot: {
+                  newRoot: { $mergeObjects: [{ $arrayElemAt: ["$starshipInfo", 0] }, "$$ROOT"] },
+                },
+              },
+              { $project: { starshipInfo: 0 } },
+            ],
+            as: "lastAssignment",
+          },
+        },
+        // merge lastAssignment[0] into the root so UI can read fields directly
+        {
+          $replaceRoot: {
+            newRoot: { $mergeObjects: [{ $arrayElemAt: ["$lastAssignment", 0] }, "$$ROOT"] },
+          },
+        },
+        { $project: { lastAssignment: 0 } },
+
         // ---- COUNTS from events for this officer ----
 
-        // Assign/Pro/Dem (used by "Starship Assignments" and similar)
+        // Assign/Pro/Dem
         {
           $lookup: {
             from: "events",
@@ -192,6 +250,9 @@ module.exports = async (req, res) => {
       if (doc.species_id) doc.species_id = String(doc.species_id);
       if (doc.birthDate) doc.birthDate = toIsoOrNull(doc.birthDate);
       if (doc.deathDate) doc.deathDate = toIsoOrNull(doc.deathDate);
+      if (doc.date) doc.date = toIsoOrNull(doc.date);
+      if (doc.endDate) doc.endDate = toIsoOrNull(doc.endDate);
+      if (doc.starshipId) doc.starshipId = String(doc.starshipId);
 
       res.statusCode = 200;
       res.setHeader("content-type", "application/json; charset=utf-8");
