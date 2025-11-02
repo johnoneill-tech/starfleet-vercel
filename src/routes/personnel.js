@@ -1,286 +1,284 @@
-// api/starfleet/personnel.js
+// src/routes/personnel.js
+// Search + detail (with picUrl[]), CRUD, and detail-level counts.
+// Mirrors the legacy Realm behavior/JSON your frontend expects.
+
 const { getDb } = require("../db");
 const { ObjectId } = require("bson");
 
-function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-function isHex24(s) { return typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s); }
+// ---------- helpers ----------
+function isHex24(s) {
+  return typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s);
+}
+function toObjectId(v) {
+  if (!v) return v;
+  return isHex24(v) ? new ObjectId(v) : v;
+}
+function toIsoOrNull(d) {
+  try {
+    if (!d) return null;
+    const dd = new Date(d);
+    return isNaN(dd.getTime()) ? null : dd.toISOString();
+  } catch { return null; }
+}
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (c) => (data += c));
+    req.on("end", () => {
+      if (!data) return resolve({});
+      try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+    });
+    req.on("error", reject);
+  });
+}
 
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
-  if (method === "OPTIONS") { res.statusCode = 204; return res.end(); }
-  if (method !== "GET") {
-    res.statusCode = 405;
-    res.setHeader("Allow", "GET, OPTIONS");
-    res.setHeader("content-type", "application/json; charset=utf-8");
-    return res.end(JSON.stringify({ message: "Method Not Allowed" }));
-  }
+  const db = await getDb();
+  const people = db.collection("officers");
 
   try {
-    const db = await getDb();
-    const col = db.collection("officers");
+    // =================== GET ===================
+    if (method === "GET") {
+      const u = new URL(req.url, "http://local");
+      const id = u.searchParams.get("id");
 
-    const u = new URL(req.url || req.originalUrl || "/", "http://local");
-    const id = u.searchParams.get("id");
+      // ------- LIST -------
+      if (!id) {
+        const perPage = Number(u.searchParams.get("personnelPerPage") || 10);
+        const page = Number(u.searchParams.get("page") || 0);
+        const name = u.searchParams.get("name"); // prefix match like old code
 
-    // ---------- DETAIL (returns full doc with picUrl: string[]) ----------
-    if (id) {
-      if (!isHex24(id)) {
-        res.statusCode = 400;
+        let query = {};
+        if (name) {
+          query = {
+            $or: [
+              { surname: { $regex: "^" + name + ".*", $options: "i" } },
+              { first:   { $regex: "^" + name + ".*", $options: "i" } },
+              { middle:  { $regex: "^" + name + ".*", $options: "i" } },
+              { alias:   { $regex: "^" + name + ".*", $options: "i" } },
+              { name:    { $regex: "^" + name + ".*", $options: "i" } }, // in case you store full name
+            ],
+          };
+        }
+
+        const pipeline = [
+          { $match: query },
+          {
+            $lookup: {
+              from: "photos",
+              let: { id: "$_id" },
+              pipeline: [
+                { $match: { $expr: { $eq: ["$owner", "$$id"] } } },
+                { $sort: { primary: -1, _id: 1 } }, // primary first
+                { $project: { _id: 0, url: 1 } },
+              ],
+              as: "pics",
+            },
+          },
+          { $addFields: { picUrl: "$pics.url" } },
+          { $project: { pics: 0 } },
+          { $sort: { surname: 1, first: 1, middle: 1 } },
+          { $skip: page * perPage },
+          { $limit: perPage },
+        ];
+
+        const list = await people.aggregate(pipeline, { allowDiskUse: true }).toArray();
+        for (const p of list) {
+          if (p._id) p._id = String(p._id);
+          if (p.species_id) p.species_id = String(p.species_id);
+          if (p.birthDate) p.birthDate = toIsoOrNull(p.birthDate);
+          if (p.deathDate) p.deathDate = toIsoOrNull(p.deathDate);
+        }
+
+        const total = await people.countDocuments(query);
+
+        res.statusCode = 200;
         res.setHeader("content-type", "application/json; charset=utf-8");
-        return res.end(JSON.stringify({ message: "Invalid id" }));
+        return res.end(
+          JSON.stringify({
+            personnel: list,
+            page: String(page),
+            entries_per_page: String(perPage),
+            total_results: String(total),
+          })
+        );
       }
 
+      // ------- DETAIL (with counts used by UI buttons) -------
       const pipeline = [
-        { $match: { _id: new ObjectId(id) } },
+        { $match: { _id: toObjectId(id) } },
 
-        // lastAssignment + ship name/registry
+        // photos (primary first)
+        {
+          $lookup: {
+            from: "photos",
+            let: { id: "$_id" },
+            pipeline: [
+              { $match: { $expr: { $eq: ["$owner", "$$id"] } } },
+              { $sort: { primary: -1, _id: 1 } },
+              { $project: { _id: 0, url: 1 } },
+            ],
+            as: "pics",
+          },
+        },
+        { $addFields: { picUrl: "$pics.url" } },
+        { $project: { pics: 0 } },
+
+        // ---- COUNTS from events for this officer ----
+
+        // Assign/Pro/Dem (used by "Starship Assignments" and similar)
         {
           $lookup: {
             from: "events",
-            let: { id: "$_id" },
+            let: { oid: "$_id" },
             pipeline: [
               {
                 $match: {
                   $and: [
-                    { $expr: { $eq: ["$officerId", "$$id"] } },
+                    { $expr: { $eq: ["$officerId", "$$oid"] } },
                     { $or: [{ type: "Assignment" }, { type: "Promotion" }, { type: "Demotion" }] },
-                    { position: { $ne: "Retired" } }
-                  ]
-                }
-              },
-              { $sort: { date: -1 } },
-              { $limit: 1 },
-              {
-                $lookup: {
-                  from: "starships",
-                  let: { id: "$starshipId" },
-                  pipeline: [
-                    { $match: { $expr: { $eq: ["$_id", "$$id"] } } },
-                    { $project: { _id: 0, name: 1, registry: 1 } }
                   ],
-                  as: "starshipInfo"
-                }
+                },
               },
-              { $replaceRoot: { newRoot: { $mergeObjects: [{ $arrayElemAt: ["$starshipInfo", 0] }, "$$ROOT"] } } },
-              { $project: { starshipInfo: 0 } }
+              { $count: "count" },
             ],
-            as: "lastAssignment"
-          }
+            as: "apdAgg",
+          },
         },
-        { $replaceRoot: { newRoot: { $mergeObjects: [{ $arrayElemAt: ["$lastAssignment", 0] }, "$$ROOT"] } } },
-        { $project: { lastAssignment: 0 } },
+        { $addFields: { assignCount: { $ifNull: [{ $arrayElemAt: ["$apdAgg.count", 0] }, 0] } } },
+        { $project: { apdAgg: 0 } },
 
-        // aggregate counts
+        // Missions
         {
           $lookup: {
             from: "events",
-            let: { id: "$_id" },
+            let: { oid: "$_id" },
             pipeline: [
-              { $match: { $and: [{ $expr: { $eq: ["$officerId", "$$id"] } }, { type: "Assignment" }, { starshipId: { $exists: true } }] } },
-              { $group: { _id: "$starshipId" } },
-              { $count: "vesslesNum" }
+              { $match: { $and: [{ $expr: { $eq: ["$officerId", "$$oid"] } }, { type: "Mission" }] } },
+              { $count: "count" },
             ],
-            as: "starshipAssignments"
-          }
+            as: "missionAgg",
+          },
         },
-        { $addFields: { starshipCount: "$starshipAssignments.vesslesNum" } },
-        { $project: { starshipAssignments: 0 } },
-        {
-          $lookup: {
-            from: "events",
-            let: { id: "$_id" },
-            pipeline: [
-              { $match: { $and: [{ $expr: { $eq: ["$officerId", "$$id"] } }, { $or: [{ type: "Assignment" }, { type: "Promotion" }, { type: "Demotion" }] }] } },
-              { $count: "AssignProDeNum" }
-            ],
-            as: "Assign-Pro-De"
-          }
-        },
-        { $addFields: { assignCount: "$Assign-Pro-De.AssignProDeNum" } },
-        { $project: { "Assign-Pro-De": 0 } },
-        {
-          $lookup: {
-            from: "events",
-            let: { id: "$_id" },
-            pipeline: [
-              { $match: { $and: [{ $expr: { $eq: ["$officerId", "$$id"] } }, { type: "Mission" }, { officerId: { $exists: false } }] } },
-              { $count: "generalNum" }
-            ],
-            as: "generalMissions"
-          }
-        },
-        { $addFields: { missionCount: "$generalMissions.generalNum" } },
-        { $project: { generalMissions: 0 } },
-        {
-          $lookup: {
-            from: "events",
-            let: { id: "$_id" },
-            pipeline: [
-              { $match: { $and: [{ $expr: { $eq: ["$officerId", "$$id"] } }, { type: "Life Event" }] } },
-              { $count: "lifeEventsNum" }
-            ],
-            as: "lifeEvents"
-          }
-        },
-        { $addFields: { lifeEventCount: "$lifeEvents.lifeEventsNum" } },
-        { $project: { lifeEvents: 0 } },
+        { $addFields: { missionCount: { $ifNull: [{ $arrayElemAt: ["$missionAgg.count", 0] }, 0] } } },
+        { $project: { missionAgg: 0 } },
 
-        // ---- PHOTOS (ARRAY): primary[] first, then newest others[]; compare as strings ----
+        // Life Events
         {
           $lookup: {
-            from: "photos",
-            let: { id: "$_id" },
+            from: "events",
+            let: { oid: "$_id" },
             pipeline: [
-              {
-                $match: {
-                  $and: [
-                    {
-                      $expr: {
-                        $eq: [
-                          { $toString: "$owner" },
-                          { $toString: "$$id" }
-                        ]
-                      }
-                    },
-                    { primary: true }
-                  ]
-                }
-              },
-              { $sort: { created_at: -1, _id: -1 } },
-              { $project: { _id: 0, url: 1 } }
+              { $match: { $and: [{ $expr: { $eq: ["$officerId", "$$oid"] } }, { type: "Life Event" }] } },
+              { $count: "count" },
             ],
-            as: "primaryPics"
-          }
+            as: "lifeAgg",
+          },
         },
-        {
-          $lookup: {
-            from: "photos",
-            let: { id: "$_id" },
-            pipeline: [
-              {
-                $match: {
-                  $expr: {
-                    $or: [
-                      {
-                        $eq: [
-                          { $toString: "$owner" },
-                          { $toString: "$$id" }
-                        ]
-                      },
-                      {
-                        $eq: [
-                          { $toString: "$subject_id" },
-                          { $toString: "$$id" }
-                        ]
-                      }
-                    ]
-                  }
-                }
-              },
-              { $sort: { created_at: -1, _id: -1 } },
-              { $project: { _id: 0, url: 1, primary: 1 } }
-            ],
-            as: "allPics"
-          }
-        },
-        // Build picUrl = [primary urls...] + [non-primary urls...], no duplicates
-        {
-          $addFields: {
-            picUrl: {
-              $concatArrays: [
-                { $ifNull: ["$primaryPics.url", []] },
-                {
-                  $map: {
-                    input: {
-                      $filter: {
-                        input: "$allPics",
-                        as: "p",
-                        cond: { $ne: ["$$p.primary", true] }
-                      }
-                    },
-                    as: "p",
-                    in: "$$p.url"
-                  }
-                }
-              ]
-            }
-          }
-        },
-        { $project: { primaryPics: 0, allPics: 0 } }
+        { $addFields: { lifeEventCount: { $ifNull: [{ $arrayElemAt: ["$lifeAgg.count", 0] }, 0] } } },
+        { $project: { lifeAgg: 0 } },
       ];
 
-      let doc = await col.aggregate(pipeline).next();
-      if (!doc) { res.statusCode = 404; res.setHeader("content-type","application/json; charset=utf-8"); return res.end(JSON.stringify({ message: "Not Found" })); }
+      const doc = await people.aggregate(pipeline, { allowDiskUse: true }).next();
+      if (!doc) {
+        res.statusCode = 404;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Not found" }));
+      }
 
-      ["birthDate","deathDate","date","endDate"].forEach(k => { if (doc[k]) doc[k] = new Date(doc[k]).toISOString(); });
-      ["starshipCount","missionCount","assignCount","lifeEventCount"].forEach(k => { if (doc[k]) doc[k] = doc[k].toString(); });
+      // legacy conversions
       doc._id = String(doc._id);
+      if (doc.species_id) doc.species_id = String(doc.species_id);
+      if (doc.birthDate) doc.birthDate = toIsoOrNull(doc.birthDate);
+      if (doc.deathDate) doc.deathDate = toIsoOrNull(doc.deathDate);
 
       res.statusCode = 200;
-      res.setHeader("content-type","application/json; charset=utf-8");
+      res.setHeader("content-type", "application/json; charset=utf-8");
       return res.end(JSON.stringify(doc));
     }
 
-    // ---------- LIST (primary only; fast) ----------
-    const personnelPerPage = parseInt(u.searchParams.get("personnelPerPage") || "10", 10);
-    const page = parseInt(u.searchParams.get("page") || "0", 10);
-    const name = (u.searchParams.get("name") || "").trim();
+    // =================== POST ===================
+    if (method === "POST") {
+      const body = await readJsonBody(req);
+      const doc = { ...body };
 
-    const query = name
-      ? { $or: [{ surname: { $regex: escRe(name), $options: "i" } }, { first: { $regex: escRe(name), $options: "i" } }] }
-      : { _id: { $exists: true } };
+      // cast refs/dates
+      if (doc.species_id) doc.species_id = toObjectId(doc.species_id);
+      if (doc.birthDate) doc.birthDate = new Date(doc.birthDate);
+      if (doc.deathDate) doc.deathDate = new Date(doc.deathDate);
 
-    const list = await col.aggregate([
-      { $match: query },
-      {
-        $lookup: {
-          from: "photos",
-          let: { id: "$_id" },
-          pipeline: [
-            {
-              $match: {
-                $and: [
-                  {
-                    $expr: {
-                      $eq: [
-                        { $toString: "$owner" },
-                        { $toString: "$$id" }
-                      ]
-                    }
-                  },
-                  { primary: true }
-                ]
-              }
-            },
-            { $project: { _id: 0, url: 1 } }
-          ],
-          as: "officerPics"
-        }
-      },
-      { $sort: { surname: 1, first: 1, middle: 1 } },
-      { $addFields: { picUrl: "$officerPics.url" } },
-      { $project: { officerPics: 0 } },
-      { $skip: page * personnelPerPage },
-      { $limit: personnelPerPage }
-    ]).toArray();
+      try {
+        await people.insertOne(doc);
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Record Inserted Successfully" }));
+      } catch (err) {
+        res.statusCode = 500;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: `Record Insert Failed ${err.message}` }));
+      }
+    }
 
-    list.forEach(o => {
-      o._id = String(o._id);
-      ["birthDate","deathDate"].forEach(k => { if (o[k]) o[k] = new Date(o[k]).toISOString(); });
-    });
+    // =================== PUT ===================
+    if (method === "PUT") {
+      const body = await readJsonBody(req);
+      const personId = body._id;
+      if (!personId || !isHex24(String(personId))) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Valid _id is required" }));
+      }
 
-    const total = await col.countDocuments(query);
-    res.statusCode = 200;
-    res.setHeader("content-type","application/json; charset=utf-8");
-    return res.end(JSON.stringify({
-      personnel: list,
-      page: String(page),
-      entries_per_page: String(personnelPerPage),
-      total_results: String(total)
-    }));
+      const updated = { ...body };
+      delete updated._id;
+
+      if (updated.species_id) updated.species_id = toObjectId(updated.species_id);
+      if (updated.birthDate) updated.birthDate = new Date(updated.birthDate);
+      if (updated.deathDate) updated.deathDate = new Date(updated.deathDate);
+
+      try {
+        await people.updateOne({ _id: new ObjectId(personId) }, { $set: updated });
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Record Updated Successfully" }));
+      } catch (err) {
+        res.statusCode = 500;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: `Record Update Failed ${err.message}` }));
+      }
+    }
+
+    // =================== DELETE ===================
+    if (method === "DELETE") {
+      const u = new URL(req.url, "http://local");
+      const id = u.searchParams.get("id");
+      if (!id || !isHex24(id)) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Valid id is required" }));
+      }
+
+      try {
+        await people.deleteOne({ _id: new ObjectId(id) });
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: "Personnel Record Successfully Deleted" }));
+      } catch (err) {
+        res.statusCode = 500;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({ message: `Deletion of Record Failed ${err.message}` }));
+      }
+    }
+
+    // Fallback
+    res.statusCode = 405;
+    res.setHeader("Allow", "GET, POST, PUT, DELETE");
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    return res.end(JSON.stringify({ message: "Method Not Allowed" }));
   } catch (e) {
     res.statusCode = 500;
-    res.setHeader("content-type","application/json; charset=utf-8");
+    res.setHeader("content-type", "application/json; charset=utf-8");
     return res.end(JSON.stringify({ message: e.message || "Internal error" }));
   }
 };
