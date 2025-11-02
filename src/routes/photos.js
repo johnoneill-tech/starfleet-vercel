@@ -1,5 +1,5 @@
 // api/starfleet/photos.js
-const { getDb } = require("../../src/db");
+const { getDb } = require("../db");
 const { ObjectId } = require("bson");
 
 function isHex24(s) { return typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s); }

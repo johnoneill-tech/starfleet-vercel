@@ -1,5 +1,5 @@
 // api/starfleet/systems.js
-const { getDb } = require("../../src/db");
+const { getDb } = require("../db");
 const { ObjectId } = require("bson");
 
 // ---------- helpers ----------

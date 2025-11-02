@@ -1,5 +1,5 @@
 // api/starfleet/starships.js
-const { getDb } = require("../../src/db");
+const { getDb } = require("../db");
 const { ObjectId } = require("bson");
 
 function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }

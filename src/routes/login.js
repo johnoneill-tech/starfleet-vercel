@@ -1,7 +1,7 @@
 // api/starfleet/login.js
 // Vercel-port of Realm "login" function (GET/POST only), matching original behavior and messages.
 
-const { getDb } = require("../../src/db");
+const { getDb } = require("../db");
 const { ObjectId } = require("bson");
 const jwt = require("jsonwebtoken");           // npm i jsonwebtoken
 const passwordHash = require("password-hash"); // npm i password-hash

@@ -1,5 +1,5 @@
 // api/starfleet/counts.js
-const { getDb } = require("../../src/db");
+const { getDb } = require("../db");
 
 module.exports = async (req, res) => {
   try {
