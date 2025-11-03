@@ -42,58 +42,121 @@ module.exports = async (req, res) => {
       const u = new URL(req.url, "http://local");
       const id = u.searchParams.get("id");
 
-      // ------- LIST -------
-      if (!id) {
-        const perPage = Number(u.searchParams.get("starshipsPerPage") || 12);
-        const page = Number(u.searchParams.get("page") || 0);
-        const name = u.searchParams.get("name");
-        const classFilter = u.searchParams.get("class"); // "All" | actual class
-        // timeframe ignored (frontend sends "all")
+// ------- LIST -------
+if (!id) {
+  const perPage = Number(u.searchParams.get("starshipsPerPage") || 12);
+  const page = Number(u.searchParams.get("page") || 0);
+  const name = u.searchParams.get("name");
+  const classFilter = u.searchParams.get("class"); // "All" | "Unknown" | actual class
+  const timeframeRaw = (u.searchParams.get("timeframe") || "All").trim();
 
-        let query = {};
-        if (name) query.name = { $regex: "^" + name + ".*", $options: "i" };
-        if (classFilter && classFilter !== "All") query.class = classFilter;
+  // --- build query parts ---
+  const ands = [];
 
-        const pipeline = [
-          { $match: query },
-          {
-            $lookup: {
-              from: "photos",
-              let: { id: "$_id" },
-              pipeline: [
-                { $match: { $expr: { $eq: ["$owner", "$$id"] } } },
-                { $sort: { primary: -1, _id: 1 } }, // primary first
-                { $project: { _id: 0, url: 1 } },
-              ],
-              as: "pics",
-            },
-          },
-          { $addFields: { picUrl: "$pics.url" } },
-          { $project: { pics: 0 } },
-          { $sort: { name: 1 } },
-          { $skip: page * perPage },
-          { $limit: perPage },
-        ];
+  // name
+  if (name && name !== "") {
+    ands.push({ name: { $regex: "^" + name + ".*", $options: "i" } });
+  } else {
+    ands.push({}); // keep shape similar to legacy
+  }
 
-        const list = await ships.aggregate(pipeline, { allowDiskUse: true }).toArray();
-        for (const s of list) {
-          if (s._id) s._id = String(s._id);
-          if (s.ship_id) s.ship_id = String(s.ship_id);
-        }
+  // class
+  if (!classFilter || classFilter === "All") {
+    // Any class or missing
+    ands.push({ $or: [{ class: { $exists: true } }, { class: { $exists: false } }] });
+  } else if (classFilter === "Unknown") {
+    ands.push({ class: { $exists: false } });
+  } else {
+    ands.push({ class: { $eq: classFilter } });
+  }
 
-        const total = await ships.countDocuments(query);
+  // timeframe → ship_id range (exclusive upper bound except for the last)
+  // Mirrors your original function:
+  // 22nd: ship_id  < 400
+  // 23rd: 400 ≤ ship_id < 2500
+  // 24th: 2500 ≤ ship_id < 110000
+  // 32nd: 110000 ≤ ship_id
+  const tf = timeframeRaw.toLowerCase();
+  let startTimeFrame = 0;
+  let endTimeFrame = Number.MAX_SAFE_INTEGER;
+  if (tf === "22nd") {
+    endTimeFrame = 400;
+  } else if (tf === "23rd") {
+    startTimeFrame = 400;
+    endTimeFrame = 2500;
+  } else if (tf === "24th") {
+    startTimeFrame = 2500;
+    endTimeFrame = 110000;
+  } else if (tf === "32nd") {
+    startTimeFrame = 110000;
+    endTimeFrame = Number.MAX_SAFE_INTEGER;
+  } else {
+    // "All" or unknown → no restriction (match all)
+    startTimeFrame = 0;
+    endTimeFrame = Number.MAX_SAFE_INTEGER;
+  }
 
-        res.statusCode = 200;
-        res.setHeader("content-type", "application/json; charset=utf-8");
-        return res.end(
-          JSON.stringify({
-            starships: list,
-            page: String(page),
-            entries_per_page: String(perPage),
-            total_results: String(total),
-          })
-        );
-      }
+  // Only add the ship_id filter if it actually restricts anything
+  if (!(startTimeFrame === 0 && endTimeFrame === Number.MAX_SAFE_INTEGER)) {
+    ands.push({
+      $and: [
+        { ship_id: { $gte: startTimeFrame } },
+        { ship_id: { $lt: endTimeFrame } }
+      ],
+    });
+  }
+
+  const query = ands.length ? { $and: ands } : {};
+
+  const pipeline = [
+    { $match: query },
+    {
+      $lookup: {
+        from: "photos",
+        let: { id: "$_id" },
+        pipeline: [
+          { $match: { $expr: { $eq: ["$owner", "$$id"] } } },
+          { $sort: { primary: -1, _id: 1 } }, // primary first
+          { $project: { _id: 0, url: 1 } },
+        ],
+        as: "pics",
+      },
+    },
+    { $addFields: { picUrl: "$pics.url" } },
+    { $project: { pics: 0 } },
+
+    // Legacy list sorted by ship_id asc; if you prefer name asc, switch this line
+    { $sort: { ship_id: 1 } },
+
+    { $skip: page * perPage },
+    { $limit: perPage },
+  ];
+
+  const list = await ships.aggregate(pipeline, { allowDiskUse: true }).toArray();
+  for (const s of list) {
+    if (s._id) s._id = String(s._id);
+    if (s.ship_id != null) s.ship_id = String(s.ship_id);
+    // Optional: normalize dates to ISO for list items too (commented out to keep payload small)
+    // for (const k of ["commission_date","decommission_date","launch_date","destruction_date"]) {
+    //   if (s[k]) s[k] = toIsoOrNull(s[k]);
+    // }
+  }
+
+  const total = await ships.countDocuments(query);
+
+  res.statusCode = 200;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  return res.end(
+    JSON.stringify({
+      starships: list,
+      page: String(page),
+      entries_per_page: String(perPage),
+      total_results: String(total),
+      search_queries: query, // handy for debugging in the UI/console
+    })
+  );
+}
+
 
       // ------- DETAIL (with counts) -------
       const pipeline = [
