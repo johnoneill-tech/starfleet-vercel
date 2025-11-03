@@ -31,6 +31,16 @@ function readJsonBody(req) {
   });
 }
 
+// timeframe → numeric ship_id range (inclusive lower, exclusive upper)
+function timeframeToRange(tf) {
+  const t = String(tf || "All").trim().toLowerCase();
+  if (t === "22nd") return { start: 0, end: 400 };
+  if (t === "23rd") return { start: 400, end: 2500 };
+  if (t === "24th") return { start: 2500, end: 110000 };
+  if (t === "32nd") return { start: 110000, end: Number.POSITIVE_INFINITY };
+  return { start: 0, end: Number.POSITIVE_INFINITY }; // All/unknown
+}
+
 module.exports = async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
   const db = await getDb();
@@ -42,107 +52,108 @@ module.exports = async (req, res) => {
       const u = new URL(req.url, "http://local");
       const id = u.searchParams.get("id");
 
-  // ------- LIST (seek/cursor by ship_id) -------
-  if (!id) {
-    const perPage = Number(u.searchParams.get("starshipsPerPage") || 12);
-    const name = u.searchParams.get("name");
-    const classFilter = u.searchParams.get("class"); // "All" | "Unknown" | actual class
-    const timeframeRaw = (u.searchParams.get("timeframe") || "All").trim();
-    const afterShipIdRaw = u.searchParams.get("after_ship_id"); // optional cursor
-    const afterShipId = afterShipIdRaw != null && afterShipIdRaw !== ""
-      ? Number(afterShipIdRaw)
-      : null;
+      // ------- LIST -------
+      if (!id) {
+        // inputs (normalize safely)
+        const perPage = Math.max(1, Number(u.searchParams.get("starshipsPerPage") || 12));
+        const page = Math.max(0, Number(u.searchParams.get("page") || 0));
+        const name = (u.searchParams.get("name") || "").trim();
+        const classRaw = (u.searchParams.get("class") || "All").trim();
+        const timeframeRaw = (u.searchParams.get("timeframe") || "All").trim();
+        const afterShipIdRaw = u.searchParams.get("after_ship_id");
+        const afterShipId = afterShipIdRaw != null && afterShipIdRaw !== "" ? Number(afterShipIdRaw) : null;
 
-    const ands = [];
+        // base filters
+        const ands = [];
 
-    // name
-    if (name && name !== "") {
-      ands.push({ name: { $regex: "^" + name + ".*", $options: "i" } });
-    } else {
-      ands.push({}); // preserve legacy shape
-    }
+        // name filter
+        if (name) {
+          ands.push({ name: { $regex: "^" + name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ".*", $options: "i" } });
+        }
 
-    // class
-    if (!classFilter || classFilter === "All") {
-      ands.push({ $or: [{ class: { $exists: true } }, { class: { $exists: false } }] });
-    } else if (classFilter === "Unknown") {
-      ands.push({ class: { $exists: false } });
-    } else {
-      ands.push({ class: { $eq: classFilter } });
-    }
+        // class filter
+        const classKey = classRaw.toLowerCase();
+        if (classKey === "all" || classRaw === "") {
+          // any or missing class
+          ands.push({ $or: [{ class: { $exists: true } }, { class: { $exists: false } }] });
+        } else if (classKey === "unknown") {
+          ands.push({ class: { $exists: false } });
+        } else {
+          ands.push({ class: { $eq: classRaw } });
+        }
 
-    // timeframe → ship_id ranges (same as your legacy)
-    const tf = timeframeRaw.toLowerCase();
-    let startTimeFrame = 0;
-    let endTimeFrame = Number.MAX_SAFE_INTEGER;
-    if (tf === "22nd") {
-      endTimeFrame = 400;
-    } else if (tf === "23rd") {
-      startTimeFrame = 400; endTimeFrame = 2500;
-    } else if (tf === "24th") {
-      startTimeFrame = 2500; endTimeFrame = 110000;
-    } else if (tf === "32nd") {
-      startTimeFrame = 110000;
-    }
-    // constrain by timeframe
-    if (!(startTimeFrame === 0 && endTimeFrame === Number.MAX_SAFE_INTEGER)) {
-      ands.push({ ship_id: { $gte: startTimeFrame, $lt: endTimeFrame } });
-    }
+        // timeframe → range
+        const { start, end } = timeframeToRange(timeframeRaw);
+        if (!(start === 0 && end === Number.POSITIVE_INFINITY)) {
+          ands.push({ ship_id: { $gte: start, $lt: end } });
+        }
 
-    // ensure deterministic field exists & type is numeric
-    ands.push({ ship_id: { $type: "number" } });
+        // ensure deterministic sort field exists & numeric
+        ands.push({ ship_id: { $type: "number" } });
 
-    // cursor: fetch strictly after the last ship_id we sent
-    if (afterShipId != null && !Number.isNaN(afterShipId)) {
-      ands.push({ ship_id: { $gt: afterShipId } });
-    }
+        // cursor (if provided) takes precedence over skip/page
+        if (afterShipId != null && !Number.isNaN(afterShipId)) {
+          ands.push({ ship_id: { $gt: afterShipId } });
+        }
 
-    const query = { $and: ands };
+        const match = ands.length ? { $and: ands } : {};
 
-    const pipeline = [
-      { $match: query },
-      {
-        $lookup: {
-          from: "photos",
-          let: { id: "$_id" },
-          pipeline: [
-            { $match: { $expr: { $eq: ["$owner", "$$id"] } } },
-            { $sort: { primary: -1, _id: 1 } },
-            { $project: { _id: 0, url: 1 } },
-          ],
-          as: "pics",
-        },
-      },
-      { $addFields: { picUrl: "$pics.url" } },
-      { $project: { pics: 0 } },
-      { $sort: { ship_id: 1 } },     // unique → strictly ordered
-      { $limit: perPage },
-    ];
+        // If using page/skip, short-circuit when we are past total to avoid 500s
+        const total = await ships.countDocuments(match);
+        if ((afterShipId == null) && (page * perPage >= total)) {
+          res.statusCode = 200;
+          res.setHeader("content-type", "application/json; charset=utf-8");
+          return res.end(JSON.stringify({
+            starships: [],
+            page: String(page),
+            entries_per_page: String(perPage),
+            total_results: String(total),
+            next_cursor: null
+          }));
+        }
 
-    const list = await ships.aggregate(pipeline, { allowDiskUse: true }).toArray();
+        const pipeline = [
+          { $match: match },
+          {
+            $lookup: {
+              from: "photos",
+              let: { id: "$_id" },
+              pipeline: [
+                { $match: { $expr: { $eq: ["$owner", "$$id"] } } },
+                { $sort: { primary: -1, _id: 1 } },
+                { $project: { _id: 0, url: 1 } },
+              ],
+              as: "pics",
+            },
+          },
+          { $addFields: { picUrl: "$pics.url" } },
+          { $project: { pics: 0 } },
+          { $sort: { ship_id: 1 } },
+          ...(afterShipId == null ? [{ $skip: page * perPage }] : []),
+          { $limit: perPage },
+        ];
 
-    // Convert ids for transport; keep ship_id numeric in DB, string in payload OK
-    for (const s of list) {
-      if (s._id) s._id = String(s._id);
-      if (s.ship_id != null) s.ship_id = String(s.ship_id);
-    }
+        let list = await ships.aggregate(pipeline, { allowDiskUse: true }).toArray();
 
-    // total_results (optional but handy for filters; uses same filters, no cursor)
-    const total = await ships.countDocuments({
-      $and: ands.filter(f => !(f.ship_id && f.ship_id.$gt != null)) // drop the cursor condition
-    });
+        // Legacy conversions for transport
+        for (const s of list) {
+          if (s._id) s._id = String(s._id);
+          if (s.ship_id != null) s.ship_id = String(s.ship_id);
+        }
 
-    const next_cursor = list.length ? { ship_id: list[list.length - 1].ship_id } : null;
+        // next_cursor for cursor clients (null if no more)
+        const next_cursor = list.length ? { ship_id: list[list.length - 1].ship_id } : null;
 
-    res.statusCode = 200;
-    res.setHeader("content-type", "application/json; charset=utf-8");
-    return res.end(JSON.stringify({
-      starships: list,
-      entries_per_page: String(perPage),
-      total_results: String(total),
-      next_cursor, // { ship_id } or null
-    }));
-  }
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        return res.end(JSON.stringify({
+          starships: list,
+          page: String(page),
+          entries_per_page: String(perPage),
+          total_results: String(total),
+          next_cursor
+        }));
+      }
 
       // ------- DETAIL (with counts) -------
       const pipeline = [
@@ -164,9 +175,7 @@ module.exports = async (req, res) => {
         { $addFields: { picUrl: "$pics.url" } },
         { $project: { pics: 0 } },
 
-        // ---- COUNTS from events ----
-
-        // 1) personnelCount = distinct officers involved in Assign/Pro/Dem events for this ship
+        // personnelCount (Assignments/Promotion/Demotion with officerId)
         {
           $lookup: {
             from: "events",
@@ -178,7 +187,7 @@ module.exports = async (req, res) => {
                     { $expr: { $eq: ["$starshipId", "$$sid"] } },
                     { $or: [{ type: "Assignment" }, { type: "Promotion" }, { type: "Demotion" }] },
                     { officerId: { $exists: true } },
-                    { position: { $ne: "Retired" } }, // mirror legacy filter
+                    { position: { $ne: "Retired" } },
                   ],
                 },
               },
@@ -191,7 +200,7 @@ module.exports = async (req, res) => {
         { $addFields: { personnelCount: { $ifNull: [{ $arrayElemAt: ["$personnelAgg.count", 0] }, 0] } } },
         { $project: { personnelAgg: 0 } },
 
-        // 2) missionCount
+        // missionCount
         {
           $lookup: {
             from: "events",
@@ -206,7 +215,7 @@ module.exports = async (req, res) => {
         { $addFields: { missionCount: { $ifNull: [{ $arrayElemAt: ["$missionAgg.count", 0] }, 0] } } },
         { $project: { missionAgg: 0 } },
 
-        // 3) maintenanceCount
+        // maintenanceCount
         {
           $lookup: {
             from: "events",
@@ -221,7 +230,7 @@ module.exports = async (req, res) => {
         { $addFields: { maintenanceCount: { $ifNull: [{ $arrayElemAt: ["$maintAgg.count", 0] }, 0] } } },
         { $project: { maintAgg: 0 } },
 
-        // 4) firstContactCount
+        // firstContactCount
         {
           $lookup: {
             from: "events",
@@ -261,11 +270,9 @@ module.exports = async (req, res) => {
       const body = await readJsonBody(req);
       const doc = { ...body };
 
-      // cast dates if present
       for (const k of ["commission_date", "decommission_date", "launch_date", "destruction_date"]) {
         if (doc[k]) doc[k] = new Date(doc[k]);
       }
-      // numeric-ish fields
       for (const k of ["crew_complement", "length", "width", "height"]) {
         if (doc[k] != null && doc[k] !== "") doc[k] = Number(doc[k]);
       }
@@ -295,11 +302,9 @@ module.exports = async (req, res) => {
       const updated = { ...body };
       delete updated._id;
 
-      // cast dates if present
       for (const k of ["commission_date", "decommission_date", "launch_date", "destruction_date"]) {
         if (updated[k]) updated[k] = new Date(updated[k]);
       }
-      // numeric casts
       for (const k of ["crew_complement", "length", "width", "height"]) {
         if (updated[k] != null && updated[k] !== "") updated[k] = Number(updated[k]);
       }
