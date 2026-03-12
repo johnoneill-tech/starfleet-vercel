@@ -270,6 +270,10 @@ module.exports = async (req, res) => {
       const body = await readJsonBody(req);
       const doc = { ...body };
 
+      if (doc.ship_id !== undefined && doc.ship_id !== null && doc.ship_id !== "") {
+        doc.ship_id = parseInt(doc.ship_id, 10);
+      }
+
       for (const k of ["commission_date", "decommission_date", "launch_date", "destruction_date"]) {
         if (doc[k]) doc[k] = new Date(doc[k]);
       }
@@ -301,6 +305,10 @@ module.exports = async (req, res) => {
 
       const updated = { ...body };
       delete updated._id;
+
+      if (updated.ship_id !== undefined && updated.ship_id !== null && updated.ship_id !== "") {
+        updated.ship_id = parseInt(updated.ship_id, 10);
+      }
 
       for (const k of ["commission_date", "decommission_date", "launch_date", "destruction_date"]) {
         if (updated[k]) updated[k] = new Date(updated[k]);
